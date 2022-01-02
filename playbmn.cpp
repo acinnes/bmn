@@ -1,7 +1,9 @@
 #include <iostream>
+#include <random>
+#include <utility>
 #include <cassert>
 
-const bool verbose = true;
+bool verbose = false;
 
 // Beggar my neighbour deal explorer.
 //
@@ -66,6 +68,12 @@ public:
         }
         *t = 0;
         return std::string(tmp);
+    }
+
+    void swap(unsigned i, unsigned j) {
+        assert(i < num_cards());
+        assert(j < num_cards());
+        std::swap(cards[(first+i) & stack_mask], cards[(first+j) & stack_mask]);
     }
 
     Card pop() {
@@ -175,8 +183,26 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks)
     }
 }
 
+unsigned best_turns = 0;
+unsigned best_tricks = 0;
+unsigned long long deals_tested = 0;
+
+void track_best_deal(StackOfCards& deal) {
+    unsigned turns, tricks;
+    play(deal, turns, tricks);
+    ++deals_tested;
+    if (turns > best_turns || tricks > best_tricks) {
+        std::cout << deal.to_string() << ": " << turns << " turns, " << tricks << " tricks" << std::endl;
+        if (turns > best_turns)
+            best_turns = turns;
+        if (tricks > best_tricks)
+            best_tricks = tricks;
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc == 2) {
+        // Test mode, to ensure accurate match of Python reference implementation.
         // Expect deal string in format used by https://github.com/matthewmayer/beggarmypython
         StackOfCards deal;
         for (char *p=argv[1]; *p != '\0'; p++) {
@@ -203,5 +229,37 @@ int main(int argc, char **argv) {
         play(deal, turns, tricks);
         std::cout << "There were " << turns << " turns" << std::endl;
         std::cout << "There were " << tricks << " tricks" << std::endl;
+
+        return 0;
+    }
+
+    // Normal invocation, to conduct pseudo-random search for a deal that produces the longest game.
+    // The basic approach is to start with a default sorted deck state, and then incrementally
+    // shuffle this to generate deals which are different from ones we've already tested. We want
+    // this to be very efficient, and as guaranteed as possible to not repeat previously seen deals,
+    // or at least to not get stuck in a loop that won't explore new possible deals.
+    //
+    // It is well-known that a simple random shuffle (linear scan with pair swapping among the
+    // remaining elements) will provide an unbiased random selection of a new permutation. So this
+    // will be used here, except we will also test games at all of the intermediate swap points. A
+    // similar approach could be used where a simple rotating position is used as the swap target,
+    // with the other element chosen at random.
+
+    StackOfCards deck;
+    //std::default_random_engine seeder(1);
+    //std::seed_seq mt_seed{seeder(), seeder(), seeder(), seeder(), seeder(), seeder(), seeder(), seeder(), };
+    //std::mt19937_64 rng(mt_seed);
+    std::mt19937_64 rng;
+
+    // Start with a fixed per-suit descending order, for reproducibilty.
+    deck.set_full_deck();
+    auto num_cards = deck.num_cards();
+    while (true) {
+        for (unsigned i=0; i<50; i++) {
+            std::uniform_int_distribution<unsigned> u(0, num_cards-i-1);
+            unsigned j = i + u(rng);
+            deck.swap(i, j);
+            track_best_deal(deck);
+        }
     }
 }
