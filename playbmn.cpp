@@ -2,6 +2,7 @@
 #include <random>
 #include <utility>
 #include <cassert>
+#include <chrono>
 
 bool verbose = false;
 
@@ -183,15 +184,36 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks)
     }
 }
 
+static std::chrono::system_clock::time_point timestamp() {
+  return std::chrono::system_clock::now();
+}
+
+std::chrono::system_clock::time_point start_time = timestamp();
+std::chrono::system_clock::time_point last_print_time = timestamp();
+using namespace std::literals;
+
 unsigned best_turns = 0;
 unsigned best_tricks = 0;
 unsigned long long deals_tested = 0;
+bool progress_printed = false;
 
 void track_best_deal(StackOfCards& deal) {
     unsigned turns, tricks;
     play(deal, turns, tricks);
     ++deals_tested;
+    auto now = timestamp();
+    if ((now - last_print_time) / 1s >= 0.5) {
+        last_print_time = now;
+        float secs_since_start = (now - start_time) / 1s;
+        std::cout << '\r' << secs_since_start << " seconds, " << deals_tested << " deals tested ("
+                  << deals_tested / secs_since_start << " per second)";
+        progress_printed = true;
+    }
     if (turns > best_turns || tricks > best_tricks) {
+        if (progress_printed) {
+            std::cout << std::endl;
+            progress_printed = false;
+        }
         std::cout << deal.to_string() << ": " << turns << " turns, " << tricks << " tricks" << std::endl;
         if (turns > best_turns)
             best_turns = turns;
