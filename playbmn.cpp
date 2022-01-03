@@ -2,7 +2,10 @@
 #include <random>
 #include <utility>
 #include <cassert>
-#include <chrono>
+#include <ctime>
+#include <cstdio>
+#include <future>
+#include <mutex>
 
 bool verbose = false;
 
@@ -135,7 +138,7 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks)
     if (verbose) {
         std::string a = hands[0].to_string();
         std::string b = hands[1].to_string();
-        std::cout << "Starting hands: " << a << "/" << b << std::endl;
+        printf("Starting hands: %s/%s\n", a.data(), b.data());
     }
 
     while (hands[0].not_empty() && hands[1].not_empty()) {
@@ -147,7 +150,7 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks)
                 std::string a = hands[0].to_string();
                 std::string b = hands[1].to_string();
                 std::string p = pile.to_string();
-                std::cout << "Turn " << turns << ": " << a << "/" << b << "/" << p << std::endl;
+                printf("Turn %d: %s/%s/%s\n", turns, a.data(), b.data(), p.data());
             };
 #endif
             Card next_card;
@@ -179,51 +182,112 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks)
             std::string a = hands[0].to_string();
             std::string b = hands[1].to_string();
             std::string p = pile.to_string();
-            std::cout << "Trick " << tricks << ": " << a << "/" << b << "/" << p << std::endl;
+            printf("Trick %d: %s/%s\n", tricks, a.data(), b.data());
         }
     }
 }
 
-static std::chrono::system_clock::time_point timestamp() {
-  return std::chrono::system_clock::now();
-}
-
-std::chrono::system_clock::time_point start_time = timestamp();
-std::chrono::system_clock::time_point last_print_time = timestamp();
-using namespace std::literals;
-
-unsigned best_turns = 0;
-unsigned best_tricks = 0;
-unsigned long long deals_tested = 0;
+std::mutex printf_mutex;
 bool progress_printed = false;
 
-void track_best_deal(StackOfCards& deal) {
-    unsigned turns, tricks;
-    play(deal, turns, tricks);
-    ++deals_tested;
-    auto now = timestamp();
-    if ((now - last_print_time) / 1s >= 0.5) {
-        last_print_time = now;
-        float secs_since_start = (now - start_time) / 1s;
-        std::cout << '\r' << secs_since_start << " seconds, " << deals_tested << " deals tested ("
-                  << deals_tested / secs_since_start << " per second)";
-        progress_printed = true;
+class BestDealSearcher {
+private:
+    clock_t start_time;
+    clock_t last_print_time;
+    unsigned best_turns = 0;
+    unsigned best_tricks = 0;
+    unsigned long deals_tested = 0;
+    int threadid = 0;
+    StackOfCards deck;
+    std::mt19937_64 rng;
+
+public:
+    BestDealSearcher(int seed) {
+        threadid = seed;
+        init(seed);
+        start_time = last_print_time = clock();
     }
-    if (turns > best_turns || tricks > best_tricks) {
-        if (progress_printed) {
-            std::cout << std::endl;
-            progress_printed = false;
+
+    void track_best_deal(StackOfCards& deal) {
+        unsigned turns, tricks;
+        play(deal, turns, tricks);
+        ++deals_tested;
+        auto now = clock();
+        if (threadid <= 1 && (now - last_print_time) / CLOCKS_PER_SEC >= 1) {
+            last_print_time = now;
+            float secs_since_start = (now - start_time) / CLOCKS_PER_SEC;
+            printf("\r%g second, %ld deals tested (%g per second)",
+                   secs_since_start, deals_tested, deals_tested / secs_since_start);
+            progress_printed = true;
         }
-        std::cout << deal.to_string() << ": " << turns << " turns, " << tricks << " tricks" << std::endl;
-        if (turns > best_turns)
-            best_turns = turns;
-        if (tricks > best_tricks)
-            best_tricks = tricks;
+        if (turns > best_turns || tricks > best_tricks) {
+            const std::lock_guard<std::mutex> lock(printf_mutex);
+            if (progress_printed) {
+                printf("\n");
+                progress_printed = false;
+            }
+            printf("%s: %d turns, %d tricks\n", deal.to_string().data(), turns, tricks);
+            if (turns > best_turns)
+                best_turns = turns;
+            if (tricks > best_tricks)
+                best_tricks = tricks;
+        }
     }
+
+    void init(int seed) {
+        // Start with a fixed per-suit descending order, for reproducibilty.
+        deck.set_full_deck();
+        // If seed is 0, leave rng in default initial state for reproducibilty
+        if (seed != 0) {
+            std::default_random_engine seeder(seed);
+            std::seed_seq mt_seed{seeder(), seeder(), seeder(), seeder(), seeder(), seeder(), seeder(), seeder(), };
+            std::mt19937_64 new_rng(mt_seed);
+            rng = new_rng;
+        }
+    }
+
+    void search(unsigned iterations) {
+        // Conduct pseudo-random search for a deal that produces the longest game. The basic
+        // approach is to start with a default sorted deck state, and then incrementally shuffle
+        // this to generate deals which are different from ones we've already tested. We want this
+        // to be very efficient, and as guaranteed as possible to not repeat previously seen deals,
+        // or at least to not get stuck in a loop that won't explore new possible deals.
+        //
+        // It is well-known that a simple random shuffle (linear scan with pair swapping among the
+        // remaining elements) will provide an unbiased random selection of a new permutation. So
+        // this will be used here, except we will also test games at all of the intermediate swap
+        // points. A similar approach could be used where a simple rotating position is used as the
+        // swap target, with the other element chosen at random.
+
+        auto num_cards = deck.num_cards();
+        bool keep_going = true;
+        while (keep_going) {
+            for (unsigned i=0; i<50; i++) {
+                std::uniform_int_distribution<unsigned> u(0, num_cards-i-1);
+                unsigned j = i + u(rng);
+                deck.swap(i, j);
+                track_best_deal(deck);
+                if (iterations-- == 0)
+                    keep_going = false;
+            }
+        }
+    }
+};
+
+void run_search(int seed) {
+    BestDealSearcher searcher(seed);
+    while (true)
+        searcher.search(1e6);
 }
 
 int main(int argc, char **argv) {
-    if (argc == 2) {
+    if (argc == 1) {
+        // Single-threaded search mode from fixed seed.
+        BestDealSearcher searcher(0);
+        while (true)
+            searcher.search(1e6);
+
+    } else if (strlen(argv[1]) >= 52) {
         // Test mode, to ensure accurate match of Python reference implementation.
         // Expect deal string in format used by https://github.com/matthewmayer/beggarmypython
         StackOfCards deal;
@@ -247,41 +311,23 @@ int main(int argc, char **argv) {
             }
         }
 
+        if (argc > 2)
+            verbose = true;
         unsigned turns, tricks;
         play(deal, turns, tricks);
-        std::cout << "There were " << turns << " turns" << std::endl;
-        std::cout << "There were " << tricks << " tricks" << std::endl;
+        printf("There were %d turns\n", turns);
+        printf("There were %d tricks\n", tricks);
 
-        return 0;
-    }
-
-    // Normal invocation, to conduct pseudo-random search for a deal that produces the longest game.
-    // The basic approach is to start with a default sorted deck state, and then incrementally
-    // shuffle this to generate deals which are different from ones we've already tested. We want
-    // this to be very efficient, and as guaranteed as possible to not repeat previously seen deals,
-    // or at least to not get stuck in a loop that won't explore new possible deals.
-    //
-    // It is well-known that a simple random shuffle (linear scan with pair swapping among the
-    // remaining elements) will provide an unbiased random selection of a new permutation. So this
-    // will be used here, except we will also test games at all of the intermediate swap points. A
-    // similar approach could be used where a simple rotating position is used as the swap target,
-    // with the other element chosen at random.
-
-    StackOfCards deck;
-    //std::default_random_engine seeder(1);
-    //std::seed_seq mt_seed{seeder(), seeder(), seeder(), seeder(), seeder(), seeder(), seeder(), seeder(), };
-    //std::mt19937_64 rng(mt_seed);
-    std::mt19937_64 rng;
-
-    // Start with a fixed per-suit descending order, for reproducibilty.
-    deck.set_full_deck();
-    auto num_cards = deck.num_cards();
-    while (true) {
-        for (unsigned i=0; i<50; i++) {
-            std::uniform_int_distribution<unsigned> u(0, num_cards-i-1);
-            unsigned j = i + u(rng);
-            deck.swap(i, j);
-            track_best_deal(deck);
+    } else if (strcmp(argv[1], "-t") == 0) {
+        int threads = atoi(argv[2]);
+        // Multi-threaded searching with different seeds
+        std::vector<std::future<void>> worker_futures;
+        for (int i=1; i<=threads; i++) {
+            worker_futures.push_back(std::async(std::launch::async, run_search, i));
+        }
+        for (auto&& worker_future : worker_futures) {
+            worker_future.get();
         }
     }
+    return 0;
 }
