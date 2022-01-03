@@ -52,11 +52,20 @@ class StackOfCards
     unsigned first = 0;
     unsigned insert = 0;
     Card cards[64];
-    const unsigned stack_mask = sizeof(cards)/sizeof(Card) - 1;
+    static const unsigned stack_mask = sizeof(cards)/sizeof(Card) - 1;
 
 public:
     DEVICE_CALLABLE
     StackOfCards() = default;
+
+    DEVICE_CALLABLE
+    bool operator==(const StackOfCards& other) {
+        return (first == other.first) && (insert == other.insert)
+            && std::memcmp(cards, other.cards, sizeof(cards)) == 0;
+    }
+
+    DEVICE_CALLABLE
+    bool operator!=(const StackOfCards& other) { return !(this->operator==(other)); }
 
     // Initialize the stack with the full standard deck, in a canonical sort order.
     DEVICE_CALLABLE
@@ -213,67 +222,33 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks)
     }
 }
 
-std::mutex global_mutex;
-
-bool progress_printed = false;
-unsigned global_best_turns = 0;
-unsigned global_best_tricks = 0;
-unsigned long global_deals_tested = 0;
-
 class BestDealSearcher {
-private:
-    clock_t start_time;
-    clock_t last_update_time;
+public:
     unsigned best_turns = 0;
     unsigned best_tricks = 0;
     unsigned long deals_tested = 0;
-    int threadid = 0;
     StackOfCards deck;
+    StackOfCards best_turns_deal;
+    StackOfCards best_tricks_deal;
     std::mt19937_64 rng;
 
-public:
     DEVICE_CALLABLE
     BestDealSearcher(int seed) {
-        threadid = seed;
         init(seed);
-        start_time = last_update_time = clock();
     }
 
     DEVICE_CALLABLE
-    void track_best_deal(StackOfCards& deal) {
+    void track_best_deal() {
         unsigned turns, tricks;
-        play(deal, turns, tricks);
+        play(deck, turns, tricks);
         ++deals_tested;
-        auto now = clock();
-        if ((now - last_update_time) / CLOCKS_PER_SEC >= 1) {
-            last_update_time = now;
-            const std::lock_guard<std::mutex> lock(global_mutex);
-            global_deals_tested += deals_tested;
-            deals_tested = 0;
-            if (threadid <= 1) {
-                float secs_since_start = (now - start_time) / CLOCKS_PER_SEC;
-                printf("\r%g seconds, %ld deals tested (%g per second)",
-                       secs_since_start, global_deals_tested, global_deals_tested / secs_since_start);
-                progress_printed = true;
-            }
+        if (turns > best_turns) {
+            best_turns = turns;
+            best_turns_deal = deck;
         }
-        if (turns > best_turns || tricks > best_tricks) {
-            if (turns > best_turns)
-                best_turns = turns;
-            if (tricks > best_tricks)
-                best_tricks = tricks;
-            const std::lock_guard<std::mutex> lock(global_mutex);
-            if (turns > global_best_turns || tricks > global_best_tricks) {
-                if (turns > global_best_turns)
-                    global_best_turns = turns;
-                if (tricks > global_best_tricks)
-                    global_best_tricks = tricks;
-                if (progress_printed) {
-                    printf("\n");
-                    progress_printed = false;
-                }
-                printf("[T%d] %s: %d turns, %d tricks\n", threadid, deal.to_string().data(), turns, tricks);
-            }
+        if (tricks > best_tricks) {
+            best_tricks = tricks;
+            best_tricks_deal = deck;
         }
     }
 
@@ -311,7 +286,7 @@ public:
                 std::uniform_int_distribution<unsigned> u(0, num_cards-i-1);
                 unsigned j = i + u(rng);
                 deck.swap(i, j);
-                track_best_deal(deck);
+                track_best_deal();
                 if (iterations-- == 0)
                     keep_going = false;
             }
@@ -319,19 +294,75 @@ public:
     }
 };
 
-DEVICE_CALLABLE
-void run_search(int seed) {
-    BestDealSearcher searcher(seed);
-    while (true)
-        searcher.search(1e6);
+// ------------------------------------------------------------------------------------------
+// Controller threads to report progress as potentially parallel search is in progress. When
+// USE_CUDA is on, each host thread passes work to a cuda stream to do a decent number of
+// iterations, then processes the results. If the cuda stream is used as a filter to identify deals
+// that don't complete within a threshold number of turns, then the host thread will work on playing
+// each unfinished deal to get the final result. Each stream will internally run threads and thread
+// blocks in parallel to the extent that is effective, and multiple streams can operate in parallel.
+
+std::mutex global_mutex;
+bool progress_printed = false;
+unsigned global_best_turns = 0;
+unsigned global_best_tricks = 0;
+unsigned long global_deals_tested = 0;
+
+void run_search(int threadid) {
+    BestDealSearcher searcher(threadid);
+    clock_t start_time = clock();
+    clock_t last_update_time = start_time;
+    while (true) {
+        // run a decent number of iterations, taking on the order of a few seconds, before stopping
+        // to update and report on the global progress.
+        searcher.search(1e5);
+
+        // report progress and best deal so far
+        const std::lock_guard<std::mutex> lock(global_mutex);
+        auto now = clock();
+        if ((now - last_update_time) / CLOCKS_PER_SEC >= 1) {
+            last_update_time = now;
+            global_deals_tested += searcher.deals_tested;
+            searcher.deals_tested = 0;
+            if (threadid <= 1) {
+                float secs_since_start = (now - start_time) / CLOCKS_PER_SEC;
+                printf("\r%g seconds, %ld deals tested (%g per second)",
+                       secs_since_start, global_deals_tested, global_deals_tested / secs_since_start);
+                progress_printed = true;
+            }
+
+            auto best_turns = searcher.best_turns;
+            auto best_tricks = searcher.best_tricks;
+            if (best_turns > global_best_turns || best_tricks > global_best_tricks) {
+                if (progress_printed) {
+                    printf("\n");
+                    progress_printed = false;
+                }
+                if (best_turns > global_best_turns) {
+                    global_best_turns = best_turns;
+                    auto& deck = searcher.best_turns_deal;
+                    unsigned turns, tricks;
+                    play(deck, turns, tricks);
+                    printf("[T%d] %s: %d turns, %d tricks\n", threadid, deck.to_string().data(), turns, tricks);
+                }
+                if (best_tricks > global_best_tricks) {
+                    global_best_tricks = best_tricks;
+                    if (searcher.best_tricks_deal != searcher.best_turns_deal) {
+                        auto& deck = searcher.best_tricks_deal;
+                        unsigned turns, tricks;
+                        play(deck, turns, tricks);
+                        printf("[T%d] %s: %d turns, %d tricks\n", threadid, searcher.best_tricks_deal.to_string().data(), turns, tricks);
+                    }
+                }
+            }
+        }
+    }
 }
 
 int main(int argc, char **argv) {
     if (argc == 1) {
         // Single-threaded search mode from fixed seed.
-        BestDealSearcher searcher(0);
-        while (true)
-            searcher.search(1e6);
+        run_search(0);
 
     } else if (strlen(argv[1]) >= 52) {
         // Test mode, to ensure accurate match of Python reference implementation.
