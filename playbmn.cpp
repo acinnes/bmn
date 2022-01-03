@@ -9,9 +9,9 @@
 
 // Generic definitions to support using classes in CUDA kernels
 #ifdef __CUDACC__
-#define CUDA_CALLABLE __host__ __device__
+#define DEVICE_CALLABLE __host__ __device__
 #else
-#define CUDA_CALLABLE
+#define DEVICE_CALLABLE
 #endif
 
 #ifdef USE_CUDA
@@ -55,10 +55,12 @@ class StackOfCards
     const unsigned stack_mask = sizeof(cards)/sizeof(Card) - 1;
 
 public:
-    CUDA_CALLABLE StackOfCards() = default;
+    DEVICE_CALLABLE
+    StackOfCards() = default;
 
     // Initialize the stack with the full standard deck, in a canonical sort order.
-    CUDA_CALLABLE void set_full_deck()
+    DEVICE_CALLABLE
+    void set_full_deck()
         {
             unsigned index = 0;
             for (int i = 0; i < 4; i++)
@@ -75,7 +77,8 @@ public:
             insert = index;
         }
 
-    CUDA_CALLABLE std::string to_string() {
+    DEVICE_CALLABLE
+    std::string to_string() {
         const char syms[] = {'-', 'J', 'Q', 'K', 'A'};
         char tmp[53];
         char *t = tmp;
@@ -89,41 +92,48 @@ public:
         return std::string(tmp);
     }
 
-    CUDA_CALLABLE void swap(unsigned i, unsigned j) {
+    DEVICE_CALLABLE
+    void swap(unsigned i, unsigned j) {
         assert(i < num_cards());
         assert(j < num_cards());
         std::swap(cards[(first+i) & stack_mask], cards[(first+j) & stack_mask]);
     }
 
-    CUDA_CALLABLE Card pop() {
+    DEVICE_CALLABLE
+    Card pop() {
         assert(num_cards() <= 52);
         assert(num_cards() > 0);
         return cards[(first++) & stack_mask];
     }
 
-    CUDA_CALLABLE void append(Card c) {
+    DEVICE_CALLABLE
+    void append(Card c) {
         assert(num_cards() < 52);
         cards[(insert++) & stack_mask] = c;
     }
 
     // Pick up a stack of cards (append here and leave the source stack empty)
-    CUDA_CALLABLE void pick_up(StackOfCards& s) {
+    DEVICE_CALLABLE
+    void pick_up(StackOfCards& s) {
         for (unsigned i = s.first; i < s.insert; i++) {
             append(s.cards[i & stack_mask]);
         }
         s.insert = s.first;
     }
 
-    CUDA_CALLABLE unsigned num_cards() {
+    DEVICE_CALLABLE
+    unsigned num_cards() {
         return insert - first;
     }
 
-    CUDA_CALLABLE bool not_empty() {
+    DEVICE_CALLABLE
+    bool not_empty() {
         return insert != first;
     }
 
     // Initialize the two hands from a starting deck
-    CUDA_CALLABLE void set_hands(StackOfCards& a, StackOfCards& b) {
+    DEVICE_CALLABLE
+    void set_hands(StackOfCards& a, StackOfCards& b) {
         assert(num_cards() == 52);
         // put first half of full deck in a, second half in b
         for (int i=0; i<26; i++) {
@@ -141,7 +151,8 @@ public:
 
 // Play out a deal, reporting the number of turns played in the game.
 // Based on https://github.com/matthewmayer/beggarmypython/blob/master/beggarmypython/__init__.py
-CUDA_CALLABLE void play(StackOfCards& deal, unsigned& turns, unsigned& tricks)
+DEVICE_CALLABLE
+void play(StackOfCards& deal, unsigned& turns, unsigned& tricks)
 {
     turns = 0;
     tricks = 0;
@@ -202,13 +213,17 @@ CUDA_CALLABLE void play(StackOfCards& deal, unsigned& turns, unsigned& tricks)
     }
 }
 
-std::mutex printf_mutex;
+std::mutex global_mutex;
+
 bool progress_printed = false;
+unsigned global_best_turns = 0;
+unsigned global_best_tricks = 0;
+unsigned long global_deals_tested = 0;
 
 class BestDealSearcher {
 private:
     clock_t start_time;
-    clock_t last_print_time;
+    clock_t last_update_time;
     unsigned best_turns = 0;
     unsigned best_tricks = 0;
     unsigned long deals_tested = 0;
@@ -217,39 +232,53 @@ private:
     std::mt19937_64 rng;
 
 public:
-    CUDA_CALLABLE BestDealSearcher(int seed) {
+    DEVICE_CALLABLE
+    BestDealSearcher(int seed) {
         threadid = seed;
         init(seed);
-        start_time = last_print_time = clock();
+        start_time = last_update_time = clock();
     }
 
-    CUDA_CALLABLE void track_best_deal(StackOfCards& deal) {
+    DEVICE_CALLABLE
+    void track_best_deal(StackOfCards& deal) {
         unsigned turns, tricks;
         play(deal, turns, tricks);
         ++deals_tested;
         auto now = clock();
-        if (threadid <= 1 && (now - last_print_time) / CLOCKS_PER_SEC >= 1) {
-            last_print_time = now;
-            float secs_since_start = (now - start_time) / CLOCKS_PER_SEC;
-            printf("\r%g second, %ld deals tested (%g per second)",
-                   secs_since_start, deals_tested, deals_tested / secs_since_start);
-            progress_printed = true;
+        if ((now - last_update_time) / CLOCKS_PER_SEC >= 1) {
+            last_update_time = now;
+            const std::lock_guard<std::mutex> lock(global_mutex);
+            global_deals_tested += deals_tested;
+            deals_tested = 0;
+            if (threadid <= 1) {
+                float secs_since_start = (now - start_time) / CLOCKS_PER_SEC;
+                printf("\r%g seconds, %ld deals tested (%g per second)",
+                       secs_since_start, global_deals_tested, global_deals_tested / secs_since_start);
+                progress_printed = true;
+            }
         }
         if (turns > best_turns || tricks > best_tricks) {
-            const std::lock_guard<std::mutex> lock(printf_mutex);
-            if (progress_printed) {
-                printf("\n");
-                progress_printed = false;
-            }
-            printf("%s: %d turns, %d tricks\n", deal.to_string().data(), turns, tricks);
             if (turns > best_turns)
                 best_turns = turns;
             if (tricks > best_tricks)
                 best_tricks = tricks;
+            const std::lock_guard<std::mutex> lock(global_mutex);
+            if (turns > global_best_turns || tricks > global_best_tricks) {
+                if (turns > global_best_turns)
+                    global_best_turns = turns;
+                if (tricks > global_best_tricks)
+                    global_best_tricks = tricks;
+                if (progress_printed) {
+                    printf("\n");
+                    progress_printed = false;
+                }
+                printf("[T%d] %s: %d turns, %d tricks\n", threadid, deal.to_string().data(), turns, tricks);
+            }
         }
     }
 
-    CUDA_CALLABLE void init(int seed) {
+    DEVICE_CALLABLE
+    void init(int seed) {
         // Start with a fixed per-suit descending order, for reproducibilty.
         deck.set_full_deck();
         // If seed is 0, leave rng in default initial state for reproducibilty
@@ -261,7 +290,8 @@ public:
         }
     }
 
-    CUDA_CALLABLE void search(unsigned iterations) {
+    DEVICE_CALLABLE
+    void search(unsigned iterations) {
         // Conduct pseudo-random search for a deal that produces the longest game. The basic
         // approach is to start with a default sorted deck state, and then incrementally shuffle
         // this to generate deals which are different from ones we've already tested. We want this
@@ -289,7 +319,8 @@ public:
     }
 };
 
-CUDA_CALLABLE void run_search(int seed) {
+DEVICE_CALLABLE
+void run_search(int seed) {
     BestDealSearcher searcher(seed);
     while (true)
         searcher.search(1e6);
