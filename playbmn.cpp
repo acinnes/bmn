@@ -7,6 +7,21 @@
 #include <future>
 #include <mutex>
 
+// Generic definitions to support using classes in CUDA kernels
+#ifdef __CUDACC__
+#define CUDA_CALLABLE __host__ __device__
+#else
+#define CUDA_CALLABLE
+#endif
+
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#include <nvrtc_helper.h>
+
+// helper functions and utilities to work with CUDA
+#include <helper_functions.h>
+#endif // USE_CUDA
+
 bool verbose = false;
 
 // Beggar my neighbour deal explorer.
@@ -40,10 +55,10 @@ class StackOfCards
     const unsigned stack_mask = sizeof(cards)/sizeof(Card) - 1;
 
 public:
-    StackOfCards() = default;
+    CUDA_CALLABLE StackOfCards() = default;
 
     // Initialize the stack with the full standard deck, in a canonical sort order.
-    void set_full_deck()
+    CUDA_CALLABLE void set_full_deck()
         {
             unsigned index = 0;
             for (int i = 0; i < 4; i++)
@@ -60,7 +75,7 @@ public:
             insert = index;
         }
 
-    std::string to_string() {
+    CUDA_CALLABLE std::string to_string() {
         const char syms[] = {'-', 'J', 'Q', 'K', 'A'};
         char tmp[53];
         char *t = tmp;
@@ -74,41 +89,41 @@ public:
         return std::string(tmp);
     }
 
-    void swap(unsigned i, unsigned j) {
+    CUDA_CALLABLE void swap(unsigned i, unsigned j) {
         assert(i < num_cards());
         assert(j < num_cards());
         std::swap(cards[(first+i) & stack_mask], cards[(first+j) & stack_mask]);
     }
 
-    Card pop() {
+    CUDA_CALLABLE Card pop() {
         assert(num_cards() <= 52);
         assert(num_cards() > 0);
         return cards[(first++) & stack_mask];
     }
 
-    void append(Card c) {
+    CUDA_CALLABLE void append(Card c) {
         assert(num_cards() < 52);
         cards[(insert++) & stack_mask] = c;
     }
 
     // Pick up a stack of cards (append here and leave the source stack empty)
-    void pick_up(StackOfCards& s) {
+    CUDA_CALLABLE void pick_up(StackOfCards& s) {
         for (unsigned i = s.first; i < s.insert; i++) {
             append(s.cards[i & stack_mask]);
         }
         s.insert = s.first;
     }
 
-    unsigned num_cards() {
+    CUDA_CALLABLE unsigned num_cards() {
         return insert - first;
     }
 
-    bool not_empty() {
+    CUDA_CALLABLE bool not_empty() {
         return insert != first;
     }
 
     // Initialize the two hands from a starting deck
-    void set_hands(StackOfCards& a, StackOfCards& b) {
+    CUDA_CALLABLE void set_hands(StackOfCards& a, StackOfCards& b) {
         assert(num_cards() == 52);
         // put first half of full deck in a, second half in b
         for (int i=0; i<26; i++) {
@@ -126,7 +141,7 @@ public:
 
 // Play out a deal, reporting the number of turns played in the game.
 // Based on https://github.com/matthewmayer/beggarmypython/blob/master/beggarmypython/__init__.py
-void play(StackOfCards& deal, unsigned& turns, unsigned& tricks)
+CUDA_CALLABLE void play(StackOfCards& deal, unsigned& turns, unsigned& tricks)
 {
     turns = 0;
     tricks = 0;
@@ -202,13 +217,13 @@ private:
     std::mt19937_64 rng;
 
 public:
-    BestDealSearcher(int seed) {
+    CUDA_CALLABLE BestDealSearcher(int seed) {
         threadid = seed;
         init(seed);
         start_time = last_print_time = clock();
     }
 
-    void track_best_deal(StackOfCards& deal) {
+    CUDA_CALLABLE void track_best_deal(StackOfCards& deal) {
         unsigned turns, tricks;
         play(deal, turns, tricks);
         ++deals_tested;
@@ -234,7 +249,7 @@ public:
         }
     }
 
-    void init(int seed) {
+    CUDA_CALLABLE void init(int seed) {
         // Start with a fixed per-suit descending order, for reproducibilty.
         deck.set_full_deck();
         // If seed is 0, leave rng in default initial state for reproducibilty
@@ -246,7 +261,7 @@ public:
         }
     }
 
-    void search(unsigned iterations) {
+    CUDA_CALLABLE void search(unsigned iterations) {
         // Conduct pseudo-random search for a deal that produces the longest game. The basic
         // approach is to start with a default sorted deck state, and then incrementally shuffle
         // this to generate deals which are different from ones we've already tested. We want this
@@ -274,7 +289,7 @@ public:
     }
 };
 
-void run_search(int seed) {
+CUDA_CALLABLE void run_search(int seed) {
     BestDealSearcher searcher(seed);
     while (true)
         searcher.search(1e6);
