@@ -66,6 +66,9 @@ public:
     DEVICE_CALLABLE
     bool operator!=(const StackOfCards& other) { return !(this->operator==(other)); }
 
+    DEVICE_CALLABLE
+    bool operator[](const int i) { return cards[(i+first) & stack_mask]; }
+
     // Initialize the stack with the full standard deck, in a canonical sort order.
     DEVICE_CALLABLE
     void set_full_deck()
@@ -101,10 +104,17 @@ public:
     }
 
     DEVICE_CALLABLE
-    void swap(unsigned i, unsigned j) {
+    bool swap(unsigned i, unsigned j) {
         assert(i < num_cards());
         assert(j < num_cards());
-        std::swap(cards[(first+i) & stack_mask], cards[(first+j) & stack_mask]);
+        auto ival = cards[(first+i) & stack_mask];
+        auto jval = cards[(first+j) & stack_mask];
+        if (ival != jval) {
+            cards[(first+i) & stack_mask] = jval;
+            cards[(first+j) & stack_mask] = ival;
+            return true;
+        }
+        return false;
     }
 
     DEVICE_CALLABLE
@@ -310,13 +320,14 @@ public:
         auto num_cards = deck.num_cards();
         bool keep_going = true;
         while (keep_going) {
-            for (unsigned i=0; i<50; i++) {
+            for (unsigned i=0; i<num_cards-1; i++) {
                 std::uniform_int_distribution<unsigned> u(0, num_cards-i-1);
                 unsigned j = i + u(rng);
-                deck.swap(i, j);
-                track_best_deal();
-                if (iterations-- == 0)
-                    keep_going = false;
+                if (deck.swap(i, j)) {
+                    track_best_deal();
+                    if (iterations-- == 0)
+                        keep_going = false;
+                }
             }
         }
     }
@@ -366,7 +377,7 @@ void run_search(int worker_id) {
         // run a decent number of iterations, taking on the order of a few seconds, before stopping
         // to update and report on the global progress.
         for (int i=0; i<SEARCHERS_PER_WORKER; i++)
-            searchers[i].search(1e5);
+            searchers[i].search((unsigned)1e5);
 
         // report progress and best deal so far
         const std::lock_guard<std::mutex> lock(global_mutex);
@@ -378,7 +389,7 @@ void run_search(int worker_id) {
                 global_deals_tested += searcher.deals_tested;
                 searcher.deals_tested = 0;
                 if (worker_id <= 1) {
-                    float secs_since_start = (now - start_time) / CLOCKS_PER_SEC;
+                    double secs_since_start = (now - start_time) / CLOCKS_PER_SEC;
                     printf("\r%g seconds, %ld deals tested (%g per second)",
                            secs_since_start, global_deals_tested, global_deals_tested / secs_since_start);
                     progress_printed = true;
