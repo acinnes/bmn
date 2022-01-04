@@ -16,9 +16,9 @@
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
-#include <nvrtc_helper.h>
+//#include <nvrtc_helper.h>
 // helper functions and utilities to work with CUDA
-#include <helper_functions.h>
+//#include <helper_functions.h>
 #endif // USE_CUDA
 
 bool verbose = false;
