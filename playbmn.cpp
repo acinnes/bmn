@@ -17,7 +17,6 @@
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
 #include <nvrtc_helper.h>
-
 // helper functions and utilities to work with CUDA
 #include <helper_functions.h>
 #endif // USE_CUDA
@@ -161,8 +160,7 @@ public:
 // Play out a deal, reporting the number of turns played in the game.
 // Based on https://github.com/matthewmayer/beggarmypython/blob/master/beggarmypython/__init__.py
 DEVICE_CALLABLE
-void play(StackOfCards& deal, unsigned& turns, unsigned& tricks)
-{
+void play(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
     turns = 0;
     tricks = 0;
     StackOfCards hands[2];
@@ -170,16 +168,19 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks)
     deal.set_hands(hands[0], hands[1]);
     unsigned player = 0;
 
+#ifndef __CUDACC__
     if (verbose) {
         std::string a = hands[0].to_string();
         std::string b = hands[1].to_string();
         printf("Starting hands: %s/%s\n", a.data(), b.data());
     }
+#endif
 
     while (hands[0].not_empty() && hands[1].not_empty()) {
         bool battle_in_progress = false;
         unsigned cards_to_play = 1;
         while (cards_to_play > 0) {
+#ifndef __CUDACC__
 #ifdef EXTRA_VERBOSE
             if (verbose) {
                 std::string a = hands[0].to_string();
@@ -187,6 +188,7 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks)
                 std::string p = pile.to_string();
                 printf("Turn %d: %s/%s/%s\n", turns, a.data(), b.data(), p.data());
             };
+#endif
 #endif
             Card next_card;
             assert(player < 2);
@@ -213,16 +215,37 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks)
         tricks++;
         player ^= 1;
         hands[player].pick_up(pile);
+#ifndef __CUDACC__
         if (verbose) {
             std::string a = hands[0].to_string();
             std::string b = hands[1].to_string();
             std::string p = pile.to_string();
             printf("Trick %d: %s/%s\n", tricks, a.data(), b.data());
         }
+#endif
     }
 }
 
-class BestDealSearcher {
+#ifdef USE_CUDA
+class Managed {
+public:
+  void *operator new(size_t len) {
+    void *ptr;
+    cudaMallocManaged(&ptr, len);
+    cudaDeviceSynchronize();
+    return ptr;
+  }
+
+  void operator delete(void *ptr) {
+    cudaDeviceSynchronize();
+    cudaFree(ptr);
+  }
+};
+#else
+class Managed {};
+#endif
+
+class BestDealSearcher : Managed {
 public:
     unsigned best_turns = 0;
     unsigned best_tricks = 0;
@@ -230,12 +253,14 @@ public:
     StackOfCards deck;
     StackOfCards best_turns_deal;
     StackOfCards best_tricks_deal;
+#ifdef __CUDACC__XXX
+    curand rng;
+#else
     std::mt19937_64 rng;
+#endif
 
     DEVICE_CALLABLE
-    BestDealSearcher(int seed) {
-        init(seed);
-    }
+    BestDealSearcher() = default;
 
     DEVICE_CALLABLE
     void track_best_deal() {
@@ -256,6 +281,8 @@ public:
     void init(int seed) {
         // Start with a fixed per-suit descending order, for reproducibilty.
         deck.set_full_deck();
+#ifdef __CUDACC__XXX
+#else
         // If seed is 0, leave rng in default initial state for reproducibilty
         if (seed != 0) {
             std::default_random_engine seeder(seed);
@@ -263,6 +290,7 @@ public:
             std::mt19937_64 new_rng(mt_seed);
             rng = new_rng;
         }
+#endif
     }
 
     DEVICE_CALLABLE
@@ -302,56 +330,82 @@ public:
 // each unfinished deal to get the final result. Each stream will internally run threads and thread
 // blocks in parallel to the extent that is effective, and multiple streams can operate in parallel.
 
+#ifdef __CUDACC__
+__global__
+void cuda_searcher(BestDealSearcher *searcher) {
+    unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    searcher.init(tid);
+    // run a decent number of iterations, taking on the order of at most a few seconds, before
+    // stopping to update and report on the global progress.
+    searcher.search(1e5);
+}
+#endif
+
 std::mutex global_mutex;
 bool progress_printed = false;
 unsigned global_best_turns = 0;
 unsigned global_best_tricks = 0;
 unsigned long global_deals_tested = 0;
 
-void run_search(int threadid) {
-    BestDealSearcher searcher(threadid);
+void run_search(int worker_id) {
+    // Generalize to allow a list of searchers to be run/managed by each worker (since in cuda mode
+    // we may want to have multiple thread blocks and/or multiple threads per block, depending how
+    // badly the play function diverges in a warp of threads).
+#ifdef USE_CUDA
+#define SEARCHERS_PER_WORKER 1
+#else
+#define SEARCHERS_PER_WORKER 1
+#endif
+    BestDealSearcher *searchers = new BestDealSearcher[SEARCHERS_PER_WORKER];
+    for (int i=0; i<SEARCHERS_PER_WORKER; i++)
+        searchers[i].init(worker_id * SEARCHERS_PER_WORKER + i);
+
     clock_t start_time = clock();
     clock_t last_update_time = start_time;
     while (true) {
         // run a decent number of iterations, taking on the order of a few seconds, before stopping
         // to update and report on the global progress.
-        searcher.search(1e5);
+        for (int i=0; i<SEARCHERS_PER_WORKER; i++)
+            searchers[i].search(1e5);
 
         // report progress and best deal so far
         const std::lock_guard<std::mutex> lock(global_mutex);
         auto now = clock();
         if ((now - last_update_time) / CLOCKS_PER_SEC >= 1) {
             last_update_time = now;
-            global_deals_tested += searcher.deals_tested;
-            searcher.deals_tested = 0;
-            if (threadid <= 1) {
-                float secs_since_start = (now - start_time) / CLOCKS_PER_SEC;
-                printf("\r%g seconds, %ld deals tested (%g per second)",
-                       secs_since_start, global_deals_tested, global_deals_tested / secs_since_start);
-                progress_printed = true;
-            }
+            for (int i=0; i<SEARCHERS_PER_WORKER; i++) {
+                auto& searcher = searchers[i];
+                global_deals_tested += searcher.deals_tested;
+                searcher.deals_tested = 0;
+                if (worker_id <= 1) {
+                    float secs_since_start = (now - start_time) / CLOCKS_PER_SEC;
+                    printf("\r%g seconds, %ld deals tested (%g per second)",
+                           secs_since_start, global_deals_tested, global_deals_tested / secs_since_start);
+                    progress_printed = true;
+                }
 
-            auto best_turns = searcher.best_turns;
-            auto best_tricks = searcher.best_tricks;
-            if (best_turns > global_best_turns || best_tricks > global_best_tricks) {
-                if (progress_printed) {
-                    printf("\n");
-                    progress_printed = false;
-                }
-                if (best_turns > global_best_turns) {
-                    global_best_turns = best_turns;
-                    auto& deck = searcher.best_turns_deal;
-                    unsigned turns, tricks;
-                    play(deck, turns, tricks);
-                    printf("[T%d] %s: %d turns, %d tricks\n", threadid, deck.to_string().data(), turns, tricks);
-                }
-                if (best_tricks > global_best_tricks) {
-                    global_best_tricks = best_tricks;
-                    if (searcher.best_tricks_deal != searcher.best_turns_deal) {
-                        auto& deck = searcher.best_tricks_deal;
+                auto best_turns = searcher.best_turns;
+                auto best_tricks = searcher.best_tricks;
+                if (best_turns > global_best_turns || best_tricks > global_best_tricks) {
+                    if (progress_printed) {
+                        printf("\n");
+                        progress_printed = false;
+                    }
+                    if (best_turns > global_best_turns) {
+                        global_best_turns = best_turns;
+                        auto& deck = searcher.best_turns_deal;
                         unsigned turns, tricks;
                         play(deck, turns, tricks);
-                        printf("[T%d] %s: %d turns, %d tricks\n", threadid, searcher.best_tricks_deal.to_string().data(), turns, tricks);
+                        printf("[T%d] %s: %d turns, %d tricks\n", worker_id, deck.to_string().data(), turns, tricks);
+                    }
+                    if (best_tricks > global_best_tricks) {
+                        global_best_tricks = best_tricks;
+                        if (searcher.best_tricks_deal != searcher.best_turns_deal) {
+                            auto& deck = searcher.best_tricks_deal;
+                            unsigned turns, tricks;
+                            play(deck, turns, tricks);
+                            printf("[T%d] %s: %d turns, %d tricks\n", worker_id, searcher.best_tricks_deal.to_string().data(), turns, tricks);
+                        }
                     }
                 }
             }
