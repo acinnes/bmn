@@ -16,6 +16,8 @@
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
+#include <curand.h>
+#include <curand_kernel.h>
 //#include <nvrtc_helper.h>
 // helper functions and utilities to work with CUDA
 //#include <helper_functions.h>
@@ -54,7 +56,6 @@ class StackOfCards
     static const unsigned stack_mask = sizeof(cards)/sizeof(Card) - 1;
 
 public:
-    DEVICE_CALLABLE
     StackOfCards() = default;
 
     DEVICE_CALLABLE
@@ -71,24 +72,20 @@ public:
 
     // Initialize the stack with the full standard deck, in a canonical sort order.
     DEVICE_CALLABLE
-    void set_full_deck()
-        {
-            unsigned index = 0;
-            for (int i = 0; i < 4; i++)
-            {
-                cards[index++] = ace;
-                cards[index++] = king;
-                cards[index++] = queen;
-                cards[index++] = jack;
-                for (int j = 0; j < 9; j++)
-                {
-                    cards[index++] = numeral;
-                }
+    void set_full_deck() {
+        unsigned index = 0;
+        for (int i = 0; i < 4; i++) {
+            cards[index++] = ace;
+            cards[index++] = king;
+            cards[index++] = queen;
+            cards[index++] = jack;
+            for (int j = 0; j < 9; j++) {
+                cards[index++] = numeral;
             }
-            insert = index;
         }
+        insert = index;
+    }
 
-    DEVICE_CALLABLE
     std::string to_string() {
         const char syms[] = {'-', 'J', 'Q', 'K', 'A'};
         char tmp[53];
@@ -190,8 +187,8 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
         bool battle_in_progress = false;
         unsigned cards_to_play = 1;
         while (cards_to_play > 0) {
-#ifndef __CUDACC__
 #ifdef EXTRA_VERBOSE
+#ifndef __CUDACC__
             if (verbose) {
                 std::string a = hands[0].to_string();
                 std::string b = hands[1].to_string();
@@ -236,26 +233,7 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
     }
 }
 
-#ifdef USE_CUDA
-class Managed {
-public:
-  void *operator new(size_t len) {
-    void *ptr;
-    cudaMallocManaged(&ptr, len);
-    cudaDeviceSynchronize();
-    return ptr;
-  }
-
-  void operator delete(void *ptr) {
-    cudaDeviceSynchronize();
-    cudaFree(ptr);
-  }
-};
-#else
-class Managed {};
-#endif
-
-class BestDealSearcher : Managed {
+class BestDealSearcher {
 public:
     unsigned best_turns = 0;
     unsigned best_tricks = 0;
@@ -263,14 +241,35 @@ public:
     StackOfCards deck;
     StackOfCards best_turns_deal;
     StackOfCards best_tricks_deal;
-#ifdef __CUDACC__XXX
-    curand rng;
+#ifdef USE_CUDA
+    // Kernel version of curand
+    curandState rng;
 #else
     std::mt19937_64 rng;
 #endif
 
-    DEVICE_CALLABLE
     BestDealSearcher() = default;
+
+#ifdef USE_CUDA
+    void *operator new(size_t len) {
+        void *ptr;
+        cudaMallocManaged(&ptr, len);
+        cudaDeviceSynchronize();
+        return ptr;
+    }
+
+    void *operator new[](size_t len) {
+        void *ptr;
+        cudaMallocManaged(&ptr, len);
+        cudaDeviceSynchronize();
+        return ptr;
+    }
+    
+    void operator delete(void *ptr) {
+        cudaDeviceSynchronize();
+        cudaFree(ptr);
+    }
+#endif
 
     DEVICE_CALLABLE
     void track_best_deal() {
@@ -287,12 +286,18 @@ public:
         }
     }
 
-    DEVICE_CALLABLE
+#ifdef USE_CUDA
+    // This can only be called from cuda kernel, not host code.
+    __device__
+    void init(int seed, int sequence) {
+        // Start with a fixed per-suit descending order, for reproducibilty.
+        deck.set_full_deck();
+        curand_init(seed, sequence, 0, &rng);
+    }
+#else
     void init(int seed) {
         // Start with a fixed per-suit descending order, for reproducibilty.
         deck.set_full_deck();
-#ifdef __CUDACC__XXX
-#else
         // If seed is 0, leave rng in default initial state for reproducibilty
         if (seed != 0) {
             std::default_random_engine seeder(seed);
@@ -300,10 +305,13 @@ public:
             std::mt19937_64 new_rng(mt_seed);
             rng = new_rng;
         }
-#endif
     }
+#endif
 
-    DEVICE_CALLABLE
+#ifdef USE_CUDA
+    // This can only be called from cuda kernel, not host code.
+    __device__
+#endif
     void search(unsigned iterations) {
         // Conduct pseudo-random search for a deal that produces the longest game. The basic
         // approach is to start with a default sorted deck state, and then incrementally shuffle
@@ -321,8 +329,14 @@ public:
         bool keep_going = true;
         while (keep_going) {
             for (unsigned i=0; i<num_cards-1; i++) {
+#ifdef USE_CUDA
+                // Ignore the slight bias from using simple modulus on random unsigned
+                unsigned offset = curand(&rng) % (num_cards-i);
+#else
                 std::uniform_int_distribution<unsigned> u(0, num_cards-i-1);
-                unsigned j = i + u(rng);
+                unsigned offset = u(rng);
+#endif
+                unsigned j = i + offset;
                 if (deck.swap(i, j)) {
                     track_best_deal();
                     if (iterations-- == 0)
@@ -341,14 +355,29 @@ public:
 // each unfinished deal to get the final result. Each stream will internally run threads and thread
 // blocks in parallel to the extent that is effective, and multiple streams can operate in parallel.
 
-#ifdef __CUDACC__
+#ifdef USE_CUDA
+// Based on experimentation on laptop with GTX 1650, 1 block with 1 thread does ~20k checks per sec,
+// and throughput plateaus by the time we have 128 blocks with 1 thread each.
+#define BLOCKS_PER_WORKER 128
+#define THREADS_PER_BLOCK 16
+#define SEARCHERS_PER_WORKER (BLOCKS_PER_WORKER * THREADS_PER_BLOCK)
+#else
+#define SEARCHERS_PER_WORKER 1
+#endif
+
+#ifdef USE_CUDA
 __global__
-void cuda_searcher(BestDealSearcher *searcher) {
+void cuda_init_searchers(BestDealSearcher *searchers) {
     unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    searcher.init(tid);
+    searchers[tid].init(blockIdx.x, threadIdx.x);
+}
+
+__global__
+void cuda_run_searchers(BestDealSearcher *searchers) {
+    unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
     // run a decent number of iterations, taking on the order of at most a few seconds, before
     // stopping to update and report on the global progress.
-    searcher.search(1e5);
+    searchers[tid].search((unsigned)10);
 }
 #endif
 
@@ -362,22 +391,26 @@ void run_search(int worker_id) {
     // Generalize to allow a list of searchers to be run/managed by each worker (since in cuda mode
     // we may want to have multiple thread blocks and/or multiple threads per block, depending how
     // badly the play function diverges in a warp of threads).
-#ifdef USE_CUDA
-#define SEARCHERS_PER_WORKER 1
-#else
-#define SEARCHERS_PER_WORKER 1
-#endif
     BestDealSearcher *searchers = new BestDealSearcher[SEARCHERS_PER_WORKER];
+#ifdef USE_CUDA
+    cuda_init_searchers<<<BLOCKS_PER_WORKER, THREADS_PER_BLOCK>>>(searchers);
+    cudaDeviceSynchronize();
+#else
     for (int i=0; i<SEARCHERS_PER_WORKER; i++)
         searchers[i].init(worker_id * SEARCHERS_PER_WORKER + i);
-
+#endif
     clock_t start_time = clock();
     clock_t last_update_time = start_time;
     while (true) {
+#ifdef USE_CUDA
+        cuda_run_searchers<<<BLOCKS_PER_WORKER, THREADS_PER_BLOCK>>>(searchers);
+        cudaDeviceSynchronize();
+#else
         // run a decent number of iterations, taking on the order of a few seconds, before stopping
         // to update and report on the global progress.
         for (int i=0; i<SEARCHERS_PER_WORKER; i++)
             searchers[i].search((unsigned)1e5);
+#endif
 
         // report progress and best deal so far
         const std::lock_guard<std::mutex> lock(global_mutex);
