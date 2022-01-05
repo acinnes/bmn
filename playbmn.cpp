@@ -8,10 +8,14 @@
 #include <mutex>
 
 // Generic definitions to support using classes in CUDA kernels
-#ifdef __CUDACC__
+#ifdef USE_CUDA
 #define DEVICE_CALLABLE __host__ __device__
+#define DEVICE_ONLY  __device__
+#define SHARED_MEM __shared__
 #else
 #define DEVICE_CALLABLE
+#define DEVICE_ONLY
+#define SHARED_MEM
 #endif
 
 #ifdef USE_CUDA
@@ -21,7 +25,37 @@
 //#include <nvrtc_helper.h>
 // helper functions and utilities to work with CUDA
 //#include <helper_functions.h>
+
+class Managed {
+public:
+    void *operator new(size_t len) {
+        void *ptr;
+        cudaMallocManaged(&ptr, len);
+        cudaDeviceSynchronize();
+        return ptr;
+    }
+
+    void *operator new[](size_t len) {
+        void *ptr;
+        cudaMallocManaged(&ptr, len);
+        cudaDeviceSynchronize();
+        return ptr;
+    }
+    
+    void operator delete(void *ptr) {
+        cudaDeviceSynchronize();
+        cudaFree(ptr);
+    }
+
+    void operator delete[](void *ptr) {
+        cudaDeviceSynchronize();
+        cudaFree(ptr);
+    }
+};
+#else
+class Managed {};
 #endif // USE_CUDA
+
 
 bool verbose = false;
 
@@ -47,7 +81,7 @@ enum Card
 // Mask the index values when referencing, and just increment indefinitely when popping and appending,
 // in order to not waste cycles with unnecessary branches for handling wrap-around.
 
-class StackOfCards
+class StackOfCards : public Managed
 {
   private:
     unsigned first = 0;
@@ -233,7 +267,7 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
     }
 }
 
-class BestDealSearcher {
+class BestDealSearcher : public Managed {
 public:
     unsigned best_turns = 0;
     unsigned best_tricks = 0;
@@ -250,45 +284,24 @@ public:
 
     BestDealSearcher() = default;
 
-#ifdef USE_CUDA
-    void *operator new(size_t len) {
-        void *ptr;
-        cudaMallocManaged(&ptr, len);
-        cudaDeviceSynchronize();
-        return ptr;
-    }
-
-    void *operator new[](size_t len) {
-        void *ptr;
-        cudaMallocManaged(&ptr, len);
-        cudaDeviceSynchronize();
-        return ptr;
-    }
-    
-    void operator delete(void *ptr) {
-        cudaDeviceSynchronize();
-        cudaFree(ptr);
-    }
-#endif
-
     DEVICE_CALLABLE
-    void track_best_deal() {
+    void track_best_deal(StackOfCards& deal) {
         unsigned turns, tricks;
-        play(deck, turns, tricks);
+        play(deal, turns, tricks);
         ++deals_tested;
         if (turns > best_turns) {
             best_turns = turns;
-            best_turns_deal = deck;
+            best_turns_deal = deal;
         }
         if (tricks > best_tricks) {
             best_tricks = tricks;
-            best_tricks_deal = deck;
+            best_tricks_deal = deal;
         }
     }
 
 #ifdef USE_CUDA
     // This can only be called from cuda kernel, not host code.
-    __device__
+    DEVICE_ONLY
     void init(int seed, int sequence) {
         // Start with a fixed per-suit descending order, for reproducibilty.
         deck.set_full_deck();
@@ -308,10 +321,8 @@ public:
     }
 #endif
 
-#ifdef USE_CUDA
     // This can only be called from cuda kernel, not host code.
-    __device__
-#endif
+    DEVICE_ONLY
     void search(unsigned iterations) {
         // Conduct pseudo-random search for a deal that produces the longest game. The basic
         // approach is to start with a default sorted deck state, and then incrementally shuffle
@@ -325,6 +336,10 @@ public:
         // points. A similar approach could be used where a simple rotating position is used as the
         // swap target, with the other element chosen at random.
 
+        //SHARED_MEM StackOfCards local_deck;
+        //local_deck = deck;
+//#define DECK local_deck
+#define DECK deck
         auto num_cards = deck.num_cards();
         bool keep_going = true;
         while (keep_going) {
@@ -337,13 +352,14 @@ public:
                 unsigned offset = u(rng);
 #endif
                 unsigned j = i + offset;
-                if (deck.swap(i, j)) {
-                    track_best_deal();
+                if (DECK.swap(i, j)) {
+                    track_best_deal(DECK);
                     if (iterations-- == 0)
                         keep_going = false;
                 }
             }
         }
+        //deck = local_deck;
     }
 };
 
@@ -359,11 +375,15 @@ public:
 // Based on experimentation on laptop with GTX 1650, 1 block with 1 thread does ~20k checks per sec,
 // and throughput plateaus by the time we have 128 blocks with 1 thread each.
 #define BLOCKS_PER_WORKER 128
-#define THREADS_PER_BLOCK 16
+#define THREADS_PER_BLOCK 32
 #define SEARCHERS_PER_WORKER (BLOCKS_PER_WORKER * THREADS_PER_BLOCK)
 #else
 #define SEARCHERS_PER_WORKER 1
 #endif
+
+unsigned blocks = BLOCKS_PER_WORKER;
+unsigned threads = THREADS_PER_BLOCK;
+unsigned num_searchers = SEARCHERS_PER_WORKER;
 
 #ifdef USE_CUDA
 __global__
@@ -391,24 +411,25 @@ void run_search(int worker_id) {
     // Generalize to allow a list of searchers to be run/managed by each worker (since in cuda mode
     // we may want to have multiple thread blocks and/or multiple threads per block, depending how
     // badly the play function diverges in a warp of threads).
-    BestDealSearcher *searchers = new BestDealSearcher[SEARCHERS_PER_WORKER];
+    BestDealSearcher *searchers = new BestDealSearcher[num_searchers];
+
 #ifdef USE_CUDA
-    cuda_init_searchers<<<BLOCKS_PER_WORKER, THREADS_PER_BLOCK>>>(searchers);
+    cuda_init_searchers<<<blocks, threads>>>(searchers);
     cudaDeviceSynchronize();
 #else
-    for (int i=0; i<SEARCHERS_PER_WORKER; i++)
-        searchers[i].init(worker_id * SEARCHERS_PER_WORKER + i);
+    for (int i=0; i<num_searchers; i++)
+        searchers[i].init(worker_id * num_searchers + i);
 #endif
     clock_t start_time = clock();
     clock_t last_update_time = start_time;
     while (true) {
 #ifdef USE_CUDA
-        cuda_run_searchers<<<BLOCKS_PER_WORKER, THREADS_PER_BLOCK>>>(searchers);
+        cuda_run_searchers<<<blocks, threads>>>(searchers);
         cudaDeviceSynchronize();
 #else
         // run a decent number of iterations, taking on the order of a few seconds, before stopping
         // to update and report on the global progress.
-        for (int i=0; i<SEARCHERS_PER_WORKER; i++)
+        for (int i=0; i<num_searchers; i++)
             searchers[i].search((unsigned)1e5);
 #endif
 
@@ -417,7 +438,7 @@ void run_search(int worker_id) {
         auto now = clock();
         if ((now - last_update_time) / CLOCKS_PER_SEC >= 1) {
             last_update_time = now;
-            for (int i=0; i<SEARCHERS_PER_WORKER; i++) {
+            for (int i=0; i<num_searchers; i++) {
                 auto& searcher = searchers[i];
                 global_deals_tested += searcher.deals_tested;
                 searcher.deals_tested = 0;
@@ -458,6 +479,22 @@ void run_search(int worker_id) {
 }
 
 int main(int argc, char **argv) {
+    const char *ev;
+    ev = getenv("SEARCHERS_PER_WORKER");
+    if (ev) {
+        num_searchers = atoi(ev);
+        blocks = 0;
+    }
+    ev = getenv("THREADS_PER_BLOCK");
+    if (ev) {
+        threads = atoi(ev);
+        blocks = 0;
+    }
+    if (blocks == 0) {
+        blocks = num_searchers / threads;
+    }
+    printf("%d/%d blocks/threads == %d searchers\n", blocks, threads, num_searchers);
+
     if (argc == 1) {
         // Single-threaded search mode from fixed seed.
         run_search(0);
