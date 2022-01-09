@@ -11,11 +11,9 @@
 #ifdef USE_CUDA
 #define DEVICE_CALLABLE __host__ __device__
 #define DEVICE_ONLY  __device__
-#define SHARED_MEM __shared__
 #else
 #define DEVICE_CALLABLE
 #define DEVICE_ONLY
-#define SHARED_MEM
 #endif
 
 #ifdef USE_CUDA
@@ -336,10 +334,14 @@ public:
         // points. A similar approach could be used where a simple rotating position is used as the
         // swap target, with the other element chosen at random.
 
-        //SHARED_MEM StackOfCards local_deck;
-        //local_deck = deck;
-//#define DECK local_deck
+#ifdef USE_CUDA_SHARED
+        int t = threadIdx.x;
+        extern __shared__ StackOfCards local_deck[];
+        local_deck[t] = deck;
+#define DECK local_deck[t]
+#else
 #define DECK deck
+#endif
         auto num_cards = deck.num_cards();
         bool keep_going = true;
         while (keep_going) {
@@ -359,7 +361,9 @@ public:
                 }
             }
         }
-        //deck = local_deck;
+#ifdef USE_CUDA
+        deck = DECK;
+#endif
     }
 };
 
@@ -424,7 +428,11 @@ void run_search(int worker_id) {
     clock_t last_update_time = start_time;
     while (true) {
 #ifdef USE_CUDA
+#ifdef USE_CUDA_SHARED
+        cuda_run_searchers<<<blocks, threads, threads*sizeof(StackOfCards)>>>(searchers);
+#else
         cuda_run_searchers<<<blocks, threads>>>(searchers);
+#endif
         cudaDeviceSynchronize();
 #else
         // run a decent number of iterations, taking on the order of a few seconds, before stopping
@@ -494,6 +502,8 @@ int main(int argc, char **argv) {
         blocks = num_searchers / threads;
     }
     printf("%d/%d blocks/threads == %d searchers\n", blocks, threads, num_searchers);
+    printf("sizeof(BestDealSearcher) is %zd bytes\n", sizeof(BestDealSearcher));
+    printf("sizeof(StackOfCards) is %zd bytes\n", sizeof(StackOfCards));
 
     if (argc == 1) {
         // Single-threaded search mode from fixed seed.
