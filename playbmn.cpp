@@ -278,6 +278,14 @@ public:
     curandState rng;
 #else
     std::mt19937_64 rng;
+    // Track stats on turns per game, to get a sense of what threshold would be useful for a
+    // fixed-iteration filter approach (where we run all games on CUDA for a fixed number of turns,
+    // and let the CPU threads look at any games that still aren't finished).
+#define MAX_TURNS 2500
+    unsigned long num_games = 0;
+    unsigned long long total_turns = 0;
+    unsigned long game_counts[MAX_TURNS + 1] = {0};
+    unsigned over_max = 0;
 #endif
 
     BestDealSearcher() = default;
@@ -287,6 +295,15 @@ public:
         unsigned turns, tricks;
         play(deal, turns, tricks);
         ++deals_tested;
+#ifndef USE_CUDA
+        num_games++;
+        total_turns += turns;
+        if (turns <= MAX_TURNS) {
+            game_counts[turns]++;
+        } else {
+            over_max++;
+        }
+#endif
         if (turns > best_turns) {
             best_turns = turns;
             best_turns_deal = deal;
@@ -382,6 +399,8 @@ public:
 #define THREADS_PER_BLOCK 32
 #define SEARCHERS_PER_WORKER (BLOCKS_PER_WORKER * THREADS_PER_BLOCK)
 #else
+#define BLOCKS_PER_WORKER 1
+#define THREADS_PER_BLOCK 1
 #define SEARCHERS_PER_WORKER 1
 #endif
 
@@ -421,11 +440,13 @@ void run_search(int worker_id) {
     cuda_init_searchers<<<blocks, threads>>>(searchers);
     cudaDeviceSynchronize();
 #else
-    for (int i=0; i<num_searchers; i++)
+    for (unsigned i=0; i<num_searchers; i++)
         searchers[i].init(worker_id * num_searchers + i);
 #endif
     clock_t start_time = clock();
     clock_t last_update_time = start_time;
+    clock_t last_stats_time = start_time;
+
     while (true) {
 #ifdef USE_CUDA
 #ifdef USE_CUDA_SHARED
@@ -437,16 +458,17 @@ void run_search(int worker_id) {
 #else
         // run a decent number of iterations, taking on the order of a few seconds, before stopping
         // to update and report on the global progress.
-        for (int i=0; i<num_searchers; i++)
+        for (unsigned i=0; i<num_searchers; i++)
             searchers[i].search((unsigned)1e5);
 #endif
 
-        // report progress and best deal so far
         const std::lock_guard<std::mutex> lock(global_mutex);
         auto now = clock();
+        // report progress and best deal so far
         if ((now - last_update_time) / CLOCKS_PER_SEC >= 1) {
             last_update_time = now;
-            for (int i=0; i<num_searchers; i++) {
+
+            for (unsigned i=0; i<num_searchers; i++) {
                 auto& searcher = searchers[i];
                 global_deals_tested += searcher.deals_tested;
                 searcher.deals_tested = 0;
@@ -483,6 +505,44 @@ void run_search(int worker_id) {
                 }
             }
         }
+#ifndef USE_CUDA
+        // Every minute report stats on number of turns per game
+        if (worker_id <= 1 && (now - last_stats_time) / CLOCKS_PER_SEC >= 60) {
+            last_stats_time = now;
+            double average_turns = (double)searchers[0].total_turns / searchers[0].num_games;
+            unsigned min_turns = 0;
+            unsigned long games_so_far = 0;
+            unsigned p50_turns = 0;
+            unsigned p75_turns = 0;
+            unsigned p95_turns = 0;
+            unsigned p99_turns = 0;
+            unsigned p999_turns = 0;
+            unsigned p9999_turns = 0;
+            for (unsigned i=0; i<MAX_TURNS; i++) {
+                if (!min_turns && searchers[0].game_counts[i] > 0)
+                    min_turns = i;
+                games_so_far += searchers[0].game_counts[i];
+                if (!p50_turns && games_so_far >= 0.05 * searchers[0].num_games)
+                    p50_turns = i;
+                if (!p75_turns && games_so_far >= 0.75 * searchers[0].num_games)
+                    p75_turns = i;
+                if (!p95_turns && games_so_far >= 0.95 * searchers[0].num_games)
+                    p95_turns = i;
+                if (!p99_turns && games_so_far >= 0.99 * searchers[0].num_games)
+                    p99_turns = i;
+                if (!p999_turns && games_so_far >= 0.999 * searchers[0].num_games)
+                    p999_turns = i;
+                if (!p9999_turns && games_so_far >= 0.9999 * searchers[0].num_games)
+                    p9999_turns = i;
+            }
+            if (progress_printed) {
+                printf("\n");
+                progress_printed = false;
+            }
+            printf("--> Turns per game: min=%u, avg=%g, p50=%u, p75=%u, p95=%u, p99=%u, p999=%u, p9999=%u, >%u=%u\n",
+                   min_turns, average_turns, p50_turns, p75_turns, p95_turns, p99_turns, p999_turns, p9999_turns, MAX_TURNS, searchers[0].over_max);
+        }
+#endif
     }
 }
 
