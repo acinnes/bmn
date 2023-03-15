@@ -388,17 +388,31 @@ public:
     }
 
     DEVICE_CALLABLE
-    bool swap(unsigned i, unsigned j) {
+    bool test_and_swap(unsigned i, unsigned j) {
+        assert(first == 0);
         assert(i < num_cards());
         assert(j < num_cards());
-        auto ival = cards[(first+i) & stack_mask];
-        auto jval = cards[(first+j) & stack_mask];
+        // Can omit the offset and mask operations in this special case.
+        auto ival = cards[i];
+        auto jval = cards[j];
         if (ival != jval) {
-            cards[(first+i) & stack_mask] = jval;
-            cards[(first+j) & stack_mask] = ival;
+            cards[i] = jval;
+            cards[j] = ival;
             return true;
         }
         return false;
+    }
+
+    DEVICE_CALLABLE
+    void swap(unsigned i, unsigned j) {
+        assert(first == 0);
+        assert(i < num_cards());
+        assert(j < num_cards());
+        // Can omit the offset and mask operations in this special case.
+        auto ival = cards[i];
+        auto jval = cards[j];
+        cards[i] = jval;
+        cards[j] = ival;
     }
 
     DEVICE_CALLABLE
@@ -637,7 +651,7 @@ public:
                 unsigned offset = u(rng);
 #endif
                 unsigned j = i + offset;
-                if (DECK.swap(i, j)) {
+                if (DECK.test_and_swap(i, j)) {
                     track_best_deal(DECK);
                     if (iterations-- == 0)
                         keep_going = false;
@@ -711,6 +725,7 @@ void run_search(int worker_id) {
 #endif
     clock_t start_time = clock();
     clock_t last_update_time = start_time;
+
     while (true) {
 #ifdef USE_CUDA
 #ifdef USE_CUDA_SHARED
@@ -789,6 +804,7 @@ int main(int argc, char **argv) {
     printf("%d/%d blocks/threads == %d searchers\n", blocks, threads, num_searchers);
     printf("sizeof(BestDealSearcher) is %zd bytes\n", sizeof(BestDealSearcher));
     printf("sizeof(StackOfCards) is %zd bytes\n", sizeof(StackOfCards));
+    printf("sizeof(action_table) is %zd bytes\n", sizeof(action_table));
 
     if (argc == 1) {
         // Single-threaded search mode from fixed seed.
