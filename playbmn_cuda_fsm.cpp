@@ -339,8 +339,12 @@ public:
 
     DEVICE_CALLABLE
     bool operator==(const StackOfCards& other) {
-        return (first == other.first) && (insert == other.insert)
-            && std::memcmp(cards, other.cards, sizeof(cards)) == 0;
+        if (num_cards() != other.num_cards())
+            return false;
+        for (unsigned i = 0; i < num_cards(); i++)
+            if (cards[(i+first) & stack_mask] != other.cards[(i+other.first) & stack_mask])
+                return false;
+        return true;
     }
 
     DEVICE_CALLABLE
@@ -370,7 +374,7 @@ public:
         insert = index;
     }
 
-    std::string to_string() {
+    std::string to_string() const {
         const char syms[] = {'-', 'J', 'Q', 'K', 'A'};
         char tmp[53];
         char *t = tmp;
@@ -435,12 +439,12 @@ public:
     }
 
     DEVICE_CALLABLE
-    unsigned num_cards() {
+    unsigned num_cards() const {
         return insert - first;
     }
 
     DEVICE_CALLABLE
-    bool not_empty() {
+    bool not_empty() const {
         return insert != first;
     }
 
@@ -595,8 +599,6 @@ public:
     DEVICE_ONLY
     void init(unsigned long long seed) {
         unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
-        by_thread[tid].best_turns = 0;
-        by_thread[tid].best_tricks = 0;
         // Use multiple CUDA threads as recommended to parallelize the shuffling
         curand_init(seed, tid, 0, &rng[tid]);
     }
@@ -609,7 +611,6 @@ public:
         // Start with a fixed per-suit descending order, for reproducibilty, then generate a fresh
         // batch of fully random shuffles ready to be played.
         StackOfCards deck;
-        StackOfCards hands[2];
         deck.set_full_deck();
         auto num_cards = deck.num_cards();
         for (unsigned deal = tid; deal < NUM_DEALS; deal += NUM_THREADS) {
@@ -707,8 +708,12 @@ void cuda_init_searcher(BestDealSearcher *searcher, unsigned long long seed) {
 }
 
 __global__
-void cuda_run_searcher(BestDealSearcher *searcher) {
+void cuda_generate_batch(BestDealSearcher *searcher) {
     searcher->generate_batch();
+}
+
+__global__
+void cuda_run_searcher(BestDealSearcher *searcher) {
     searcher->play_batch();
 }
 
@@ -726,13 +731,15 @@ void run_search(unsigned long long seed) {
     clock_t last_update_time = start_time;
 
     while (true) {
+        searcher->next_deal_to_play = 0;
+        cuda_generate_batch<<<BLOCKS, THREADS_PER_BLOCK>>>(searcher);
         cuda_run_searcher<<<BLOCKS, THREADS_PER_BLOCK>>>(searcher);
         cudaDeviceSynchronize();
-        global_deals_tested += NUM_DEALS;
         // To avoid unnecessary thread synchronization we track the best deals per thread while
         // playing, so we now need to update the best ones seen across all of the threads and
         // batches so far.
         searcher->update_best_deals();
+        global_deals_tested += NUM_DEALS;
 
         // Report progress and best deals so far, but at most once a second
         auto now = clock();
@@ -750,18 +757,28 @@ void run_search(unsigned long long seed) {
                 }
                 if (searcher->best_turns > global_best_turns) {
                     global_best_turns = searcher->best_turns;
-                    auto& deck = searcher->best_turns_deal;
+                    auto deck = searcher->best_turns_deal;
                     unsigned turns, tricks;
                     play(deck, turns, tricks);
                     printf("%s: %d turns, %d tricks\n", deck.to_string().data(), turns, tricks);
+                    if (turns != global_best_turns) {
+                        unsigned fsm_turns, fsm_tricks;
+                        play_fsm(deck, fsm_turns, fsm_tricks);
+                        printf("GPU got %u turns, CPU got %u, fsm got %u\n", global_best_turns, turns, fsm_turns);
+                    }
                 }
                 if (searcher->best_tricks > global_best_tricks) {
                     global_best_tricks = searcher->best_tricks;
                     if (searcher->best_tricks_deal != searcher->best_turns_deal) {
-                        auto& deck = searcher->best_tricks_deal;
+                        auto deck = searcher->best_tricks_deal;
                         unsigned turns, tricks;
                         play(deck, turns, tricks);
                         printf("%s: %d turns, %d tricks\n", deck.to_string().data(), turns, tricks);
+                        if (tricks != global_best_tricks) {
+                            unsigned fsm_turns, fsm_tricks;
+                            play_fsm(deck, fsm_turns, fsm_tricks);
+                            printf("GPU got %u tricks, CPU got %u, fsm got %u\n", global_best_tricks, tricks, fsm_tricks);
+                        }
                     }
                 }
             }
@@ -776,12 +793,49 @@ int main(int argc, char **argv) {
     printf("sizeof(action_table) is %zd bytes\n", sizeof(action_table));
 
     if (argc == 1 || (argc == 3 && !strcmp(argv[1], "--seed"))) {
-        // Single-threaded search mode from fixed seed.
+        // GPU search mode from fixed seed.
         int seed = 0;
         if (argc == 3 && !strcmp(argv[1], "--seed")) {
             seed = atoi(argv[2]);
         }
         run_search(seed);
+
+    } else if (argc == 3 && !strcmp(argv[1], "test-fsm")) {
+        // Play number of iterations to check that fsm and original version agree.
+        int seed = 0;
+        int iterations = atoi(argv[2]);
+        std::mt19937_64 rng;
+        // If seed is 0, leave rng in default initial state for reproducibilty
+        if (seed != 0) {
+            std::default_random_engine seeder(seed);
+            std::seed_seq mt_seed{seeder(), seeder(), seeder(), seeder(), seeder(), seeder(), seeder(), seeder(), };
+            std::mt19937_64 new_rng(mt_seed);
+            rng = new_rng;
+        }
+
+        StackOfCards deal;
+        deal.set_full_deck();
+        auto num_cards = deal.num_cards();
+        bool keep_going = true;
+        while (keep_going) {
+            for (unsigned i=0; i<num_cards-1; i++) {
+                std::uniform_int_distribution<unsigned> u(0, num_cards-i-1);
+                unsigned offset = u(rng);
+                unsigned j = i + offset;
+                if (deal.test_and_swap(i, j)) {
+                    printf("\r[%4d] %s: ", i, deal.to_string().data());
+                    unsigned turns, tricks;
+                    play(deal, turns, tricks);
+                    unsigned fsm_turns, fsm_tricks;
+                    play_fsm(deal, fsm_turns, fsm_tricks);
+                    if (turns != fsm_turns || tricks != fsm_tricks) {
+                        printf("FSM got %u/%u turns/tricks, CPU got %u/%u\n", fsm_turns, fsm_tricks, turns, tricks);
+                    }
+                    if (iterations-- == 0)
+                        keep_going = false;
+                }
+            }
+        }
 
     } else if (strlen(argv[1]) >= 52) {
         // Test mode, to ensure accurate match of Python reference implementation.
