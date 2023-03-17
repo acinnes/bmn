@@ -137,7 +137,7 @@ NextAction action_table[NUM_PLAYERS][NUM_STATES][NUM_CARDS] =
         },
         // state = pay1
         {
-            { discard_pile, discard_pile, pickup_by_1, 1, 1 },
+            { discard_pile, discard_pile, pickup_by_1, 1, 0 },
             { discard_pile, player_1, pay1, 1, 0 },
             { discard_pile, player_1, pay2, 1, 0 },
             { discard_pile, player_1, pay3, 1, 0 },
@@ -204,7 +204,7 @@ NextAction action_table[NUM_PLAYERS][NUM_STATES][NUM_CARDS] =
         },
         // state = pay1
         {
-            { discard_pile, discard_pile, pickup_by_0, 1, 1 },
+            { discard_pile, discard_pile, pickup_by_0, 1, 0 },
             { discard_pile, player_0, pay1, 1, 0 },
             { discard_pile, player_0, pay2, 1, 0 },
             { discard_pile, player_0, pay3, 1, 0 },
@@ -312,7 +312,7 @@ NextAction action_table[NUM_PLAYERS][NUM_STATES][NUM_CARDS] =
             { player_0, discard_pile, pickup_by_0, 0, 0 },
             { player_0, discard_pile, pickup_by_0, 0, 0 },
             { player_0, discard_pile, pickup_by_0, 0, 0 },
-            { player_0, player_0, discard, 0, 0 }
+            { player_0, player_0, discard, 0, 1 }
         },
         // state = pickup_by_1
         {
@@ -321,7 +321,7 @@ NextAction action_table[NUM_PLAYERS][NUM_STATES][NUM_CARDS] =
             { player_1, discard_pile, pickup_by_1, 0, 0 },
             { player_1, discard_pile, pickup_by_1, 0, 0 },
             { player_1, discard_pile, pickup_by_1, 0, 0 },
-            { player_1, player_1, discard, 0, 0 }
+            { player_1, player_1, discard, 0, 1 }
         }
     }
 };
@@ -452,6 +452,11 @@ public:
     }
 
     DEVICE_CALLABLE
+    bool empty() const {
+        return insert == first;
+    }
+
+    DEVICE_CALLABLE
     bool not_empty() const {
         return insert != first;
     }
@@ -480,7 +485,7 @@ void play_fsm(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
     turns = 0;
     tricks = 0;
     StackOfCards hands[NUM_PLAYERS];
-    deal.set_hands(hands[0], hands[1]);
+    deal.set_hands(hands[player_0], hands[player_1]);
     Player player = player_0;
     GameState game_state = discard;
     Card next_card;
@@ -511,10 +516,13 @@ void play_fsm(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
         if (verbose && next_action.count_trick) {
             std::string a = hands[0].to_string();
             std::string b = hands[1].to_string();
-            std::string p = hands[discard_pile].to_string();
             printf("FSM - Trick %d: %s/%s\n", tricks, a.data(), b.data());
         }
 #endif
+        if (next_action.count_trick && (hands[player_0].empty() || hands[player_1].empty())) {
+            // Don't start another trick if the losing player is now out of cards.
+            game_state = game_over;
+        }
     }
 }
 
@@ -702,6 +710,10 @@ public:
                 game_state = next_action.next_state;
                 turns += next_action.count_turn;
                 tricks += next_action.count_trick;
+                if (next_action.count_trick && (hands[player_0].empty() || hands[player_1].empty())) {
+                    // Don't start another trick if the losing player is now out of cards.
+                    game_state = game_over;
+                }
             }
         }
     }
