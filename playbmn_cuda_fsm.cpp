@@ -7,12 +7,16 @@
 #include <future>
 #include <mutex>
 
-// This version is designed to only run on CUDA.
-
 // Generic definitions to support using classes in CUDA kernels
+#ifdef USE_CUDA
 #define DEVICE_CALLABLE __host__ __device__
 #define DEVICE_ONLY  __device__
+#else
+#define DEVICE_CALLABLE
+#define DEVICE_ONLY
+#endif
 
+#ifdef USE_CUDA
 #include <cuda_runtime.h>
 #include <curand.h>
 #include <curand_kernel.h>
@@ -46,6 +50,10 @@ public:
         cudaFree(ptr);
     }
 };
+#else
+class Managed {};
+#endif // USE_CUDA
+
 
 bool verbose = false;
 
@@ -491,6 +499,22 @@ void play_fsm(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
         game_state = next_action.next_state;
         turns += next_action.count_turn;
         tricks += next_action.count_trick;
+#ifndef __CUDACC__
+#ifdef EXTRA_VERBOSE
+        if (verbose && next_action.count_turn) {
+            std::string a = hands[0].to_string();
+            std::string b = hands[1].to_string();
+            std::string p = hands[discard_pile].to_string();
+            printf("FSM - Turn %d: %s/%s/%s\n", turns, a.data(), b.data(), p.data());
+        }
+#endif
+        if (verbose && next_action.count_trick) {
+            std::string a = hands[0].to_string();
+            std::string b = hands[1].to_string();
+            std::string p = hands[discard_pile].to_string();
+            printf("FSM - Trick %d: %s/%s\n", tricks, a.data(), b.data());
+        }
+#endif
     }
 }
 
@@ -562,6 +586,8 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
 #endif
     }
 }
+
+#ifdef USE_CUDA
 
 // Class for efficient bulk playing of many deals. The approach is to allow many CUDA threads to
 // stay converged nearly all the time, by avoiding synchronization at the end of a game. Instead,
@@ -786,11 +812,19 @@ void run_search(unsigned long long seed) {
     }
 }
 
+#else // !USE_CUDA
+
+void run_search(unsigned long long seed) {}
+
+#endif // USE_CUDA
+
 int main(int argc, char **argv) {
+#ifdef USE_CUDA
     printf("%d/%d blocks/threads == %d searchers\n", BLOCKS, THREADS_PER_BLOCK, BLOCKS * THREADS_PER_BLOCK);
     printf("sizeof(BestDealSearcher) is %zd bytes\n", sizeof(BestDealSearcher));
     printf("sizeof(StackOfCards) is %zd bytes\n", sizeof(StackOfCards));
     printf("sizeof(action_table) is %zd bytes\n", sizeof(action_table));
+#endif
 
     if (argc == 1 || (argc == 3 && !strcmp(argv[1], "--seed"))) {
         // GPU search mode from fixed seed.
@@ -817,13 +851,15 @@ int main(int argc, char **argv) {
         deal.set_full_deck();
         auto num_cards = deal.num_cards();
         bool keep_going = true;
+        int deal_count = 0;
         while (keep_going) {
             for (unsigned i=0; i<num_cards-1; i++) {
                 std::uniform_int_distribution<unsigned> u(0, num_cards-i-1);
                 unsigned offset = u(rng);
                 unsigned j = i + offset;
                 if (deal.test_and_swap(i, j)) {
-                    printf("\r[%4d] %s: ", i, deal.to_string().data());
+                    ++deal_count;
+                    printf("\r[%4d] %s: ", deal_count, deal.to_string().data());
                     unsigned turns, tricks;
                     play(deal, turns, tricks);
                     unsigned fsm_turns, fsm_tricks;
@@ -831,8 +867,10 @@ int main(int argc, char **argv) {
                     if (turns != fsm_turns || tricks != fsm_tricks) {
                         printf("FSM got %u/%u turns/tricks, CPU got %u/%u\n", fsm_turns, fsm_tricks, turns, tricks);
                     }
-                    if (iterations-- == 0)
+                    if (--iterations == 0) {
                         keep_going = false;
+                        break;
+                    }
                 }
             }
         }
@@ -875,7 +913,7 @@ int main(int argc, char **argv) {
             play_fsm(deal, turns, tricks);
             printf("There were %d turns\n", turns);
             printf("There were %d tricks\n", tricks);
-            verbose = false;
+            //verbose = false;
             printf("Testing original play...\n");
         }
         play(deal, turns, tricks);
