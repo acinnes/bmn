@@ -603,7 +603,7 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
 // each deal is recorded in-situ for later analysis, so determination of the best deal does not slow
 // down game play. (That can be done as another bulk pass at the end.)
 
-#define BLOCKS 128
+#define BLOCKS 32
 #define THREADS_PER_BLOCK 32
 #define NUM_THREADS (BLOCKS * THREADS_PER_BLOCK)
 #define NUM_DEALS (1*1024*1024)
