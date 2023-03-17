@@ -395,7 +395,7 @@ public:
 #ifdef USE_CUDA
 // Based on experimentation on laptop with GTX 1650, 1 block with 1 thread does ~20k checks per sec,
 // and throughput plateaus by the time we have 128 blocks with 1 thread each.
-#define BLOCKS_PER_WORKER 128
+#define BLOCKS_PER_WORKER 32
 #define THREADS_PER_BLOCK 32
 #define SEARCHERS_PER_WORKER (BLOCKS_PER_WORKER * THREADS_PER_BLOCK)
 #else
