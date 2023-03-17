@@ -11,9 +11,11 @@
 #ifdef USE_CUDA
 #define DEVICE_CALLABLE __host__ __device__
 #define DEVICE_ONLY  __device__
+#define CONSTANT __constant__
 #else
 #define DEVICE_CALLABLE
 #define DEVICE_ONLY
+#define CONSTANT
 #endif
 
 #ifdef USE_CUDA
@@ -120,6 +122,7 @@ struct NextAction
 // we make the turn and trick increments for each game cycle part of the action lookup information.
 
 DEVICE_ONLY
+//CONSTANT
 NextAction action_table[NUM_PLAYERS][NUM_STATES][NUM_CARDS] =
 {
     // Inner elements are of the form { destination, next_player, next_state, count_turn, count_trick }
@@ -607,6 +610,9 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
 #define THREADS_PER_BLOCK 32
 #define NUM_THREADS (BLOCKS * THREADS_PER_BLOCK)
 #define NUM_DEALS (1*1024*1024)
+#define RNG_BLOCKS 16
+#define RNG_THREADS_PER_BLOCK 32
+#define NUM_RNGS (RNG_BLOCKS * RNG_THREADS_PER_BLOCK)
 
 class BestDealSearcher : public Managed {
 public:
@@ -624,7 +630,7 @@ public:
         unsigned best_tricks_deal;
     } by_thread[NUM_THREADS];
     // Use kernel version of curand in multi-threaded way
-    curandState rng[NUM_THREADS];
+    curandState rng[NUM_RNGS];
     // Batch of deals to play; this is not mutated, so we can read back the best deal(s) at the end.
     StackOfCards deals[NUM_DEALS];
 
@@ -647,7 +653,7 @@ public:
         StackOfCards deck;
         deck.set_full_deck();
         auto num_cards = deck.num_cards();
-        for (unsigned deal = tid; deal < NUM_DEALS; deal += NUM_THREADS) {
+        for (unsigned deal = tid; deal < NUM_DEALS; deal += NUM_RNGS) {
             for (unsigned i = 0; i < num_cards-1; i++) {
                 // Ignore the slight bias from using simple modulus on random unsigned
                 unsigned offset = curand(&my_rng) % (num_cards-i);
@@ -657,8 +663,6 @@ public:
             deals[deal] = deck;
         }
         rng[tid] = my_rng;
-        by_thread[tid].best_turns = best_turns;
-        by_thread[tid].best_tricks = best_tricks;
     }
 
     // Many CUDA threads will execute this in parallel. The aim is to keep threads as converged as
@@ -668,6 +672,19 @@ public:
     // game, by moving game state into each deal so we can switch game by just changing `this_deal`.
     DEVICE_ONLY
     void play_batch() {
+#ifdef USE_SHARED_TABLE
+        // Keep action table in fast shared memory, rather than relying on caching. In practice it
+        // made no difference though.
+        __shared__ NextAction shared_action_table[NUM_PLAYERS][NUM_STATES][NUM_CARDS];
+        if (threadIdx.x == 0) {
+            for (unsigned i=0; i < sizeof(action_table)/sizeof(unsigned); i++)
+                ((unsigned *)shared_action_table)[i] = ((unsigned *)action_table)[i];
+        }
+        __syncthreads();
+        #define ACTION_TABLE shared_action_table
+#else
+        #define ACTION_TABLE action_table
+#endif
         unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
         unsigned turns = 0;
         unsigned tricks = 0;
@@ -676,6 +693,8 @@ public:
         Player player;
         Card next_card;
         StackOfCards hands[NUM_PLAYERS];
+        by_thread[tid].best_turns = best_turns;
+        by_thread[tid].best_tricks = best_tricks;
 
         while (true) {
             if (game_state == game_over) {
@@ -702,7 +721,7 @@ public:
                     next_card = hands[player].pop();
                 else
                     next_card = no_card;
-                NextAction &next_action = action_table[player][game_state][next_card];
+                NextAction &next_action = ACTION_TABLE[player][game_state][next_card];
                 assert(next_action.next_state != logic_error);
                 if (next_card != no_card)
                     hands[next_action.destination].append(next_card);
@@ -763,14 +782,14 @@ unsigned long long global_deals_tested = 0;
 void run_search(unsigned long long seed) {
     BestDealSearcher *searcher = new BestDealSearcher();
 
-    cuda_init_searcher<<<BLOCKS, THREADS_PER_BLOCK>>>(searcher, seed);
+    cuda_init_searcher<<<RNG_BLOCKS, RNG_THREADS_PER_BLOCK>>>(searcher, seed);
     cudaDeviceSynchronize();
     clock_t start_time = clock();
     clock_t last_update_time = start_time;
 
     while (true) {
         searcher->next_deal_to_play = 0;
-        cuda_generate_batch<<<BLOCKS, THREADS_PER_BLOCK>>>(searcher);
+        cuda_generate_batch<<<RNG_BLOCKS, RNG_THREADS_PER_BLOCK>>>(searcher);
         cuda_run_searcher<<<BLOCKS, THREADS_PER_BLOCK>>>(searcher);
         cudaDeviceSynchronize();
         // To avoid unnecessary thread synchronization we track the best deals per thread while
