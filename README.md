@@ -1,5 +1,6 @@
 Best run so far:
 
+```
 C:\Users\AndrewInnes\home\progs\bmn>playbmn_cuda_fsm
 32/32 blocks/threads == 1024 searchers
 sizeof(BestDealSearcher) is 276890144 bytes
@@ -36,3 +37,4 @@ Q-K-----JJQ------K----A-K-JA------------KJ-A-Q--Q-A-: 4983 turns, 698 tricks
 16745 seconds, 57864617984 deals tested (3.45564e+06 per second)
 Q----J-K-A----J---------JK-----A-Q-A--QA----K-JK---Q: 5486 turns, 773 tricks
 21748 seconds, 75084333056 deals tested (3.45247e+06 per second)
+```
