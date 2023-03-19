@@ -1,4 +1,56 @@
-Best run so far:
+Best run so far, making Card uint8_t, and packing the action_table entries into fewer bits.
+
+```
+C:\Users\AndrewInnes\home\progs\bmn>playbmn_cuda_fsm
+32/32 blocks/threads == 1024 searchers
+sizeof(BestDealSearcher) is 75538592 bytes
+sizeof(StackOfCards) is 72 bytes
+sizeof(action_table) is 1008 bytes
+1 seconds, 6291456 deals tested (6.29146e+06 per second)
+Q-----KQ---QA--J--J-A-A-J---QK-----K----JA------K---: 3316 turns, 457 tricks
+2 seconds, 12582912 deals tested (6.29146e+06 per second)
+-----J--A----Q-A-A-Q--JK-K-J----Q---Q-A-J-K------K--: 3556 turns, 490 tricks
+3 seconds, 18874368 deals tested (6.29146e+06 per second)
+-Q--K----Q-JAK-------J----AK--A---JA---KQ----Q-----J: 3737 turns, 516 tricks
+4 seconds, 25165824 deals tested (6.29146e+06 per second)
+-----A----K--A----KQ------K--JQJQA------A-Q------KJJ: 3741 turns, 513 tricks
+10 seconds, 56623104 deals tested (5.66231e+06 per second)
+--J----J------KQ--K---A--A--AQ-Q--------J-KA---J--KQ: 4901 turns, 696 tricks
+270 seconds, 1264582656 deals tested (4.68364e+06 per second)
+```
+
+
+Previous best run so far, which is using a ` __shared__` copy of `action_table`.
+
+Nsight Compute indicates it is memory bound, with low utilization of compute resources (around 10%
+of SOL, vs. 60% for memory). For reference, using 8 CPU threads on laptop with 8 cores, the original
+algorithm manages about 2.1e6 deals per second. Using 16 CPU threads, it runs at 2.2e6.
+
+```
+C:\Users\AndrewInnes\home\progs\bmn>playbmn_cuda_fsm
+32/32 blocks/threads == 1024 searchers
+sizeof(BestDealSearcher) is 276865568 bytes
+sizeof(StackOfCards) is 264 bytes
+sizeof(action_table) is 2016 bytes
+1 seconds, 5242880 deals tested (5.24288e+06 per second)
+Q-----KQ---QA--J--J-A-A-J---QK-----K----JA------K---: 3316 turns, 457 tricks
+2 seconds, 10485760 deals tested (5.24288e+06 per second)
+-----J--A----Q-A-A-Q--JK-K-J----Q---Q-A-J-K------K--: 3556 turns, 490 tricks
+3 seconds, 15728640 deals tested (5.24288e+06 per second)
+-Q--K----Q-JAK-------J----AK--A---JA---KQ----Q-----J: 3737 turns, 516 tricks
+5 seconds, 26214400 deals tested (5.24288e+06 per second)
+-----A----K--A----KQ------K--JQJQA------A-Q------KJJ: 3741 turns, 513 tricks
+12 seconds, 57671680 deals tested (4.80597e+06 per second)
+--J----J------KQ--K---A--A--AQ-Q--------J-KA---J--KQ: 4901 turns, 696 tricks
+3858 seconds, 15517876224 deals tested (4.02226e+06 per second)
+Q-K-----JJQ------K----A-K-JA------------KJ-A-Q--Q-A-: 4983 turns, 698 tricks
+6782 seconds, 27266121728 deals tested (4.02037e+06 per second)
+--------KQ---A---QJKJ---Q---K-----JJ--AQ-AK---A-----: 5603 turns, 765 tricks
+28514 seconds, 114478284800 deals tested (4.01481e+06 per second)
+```
+
+
+Original best run:
 
 ```
 C:\Users\AndrewInnes\home\progs\bmn>playbmn_cuda_fsm
