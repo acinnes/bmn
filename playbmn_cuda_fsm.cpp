@@ -65,7 +65,7 @@ bool verbose = false;
 // to find the longest possible games of BMN.
 
 // Use a simplified representation of cards that is optimized for BMN.
-enum Card
+enum Card : uint8_t
 {
     numeral = 0,
     jack = 1,
@@ -105,11 +105,11 @@ enum GameState
 // moves, whether a turn should be counted and whether a trick should be counted.
 struct NextAction
 {
-    Player destination;         // index to the right stack of cards to receive next_card
-    Player next_player;         // player (or pile as a psuedo-player) who takes the next turn
-    GameState next_state;       // game state facing the next player
-    bool count_turn;            // true (ie. 1) if turn count should be incremented
-    bool count_trick;           // same for trick count
+    Player destination : 4;         // index to the right stack of cards to receive next_card
+    Player next_player : 2;         // player (or pile as a psuedo-player) who takes the next turn
+    GameState next_state : 4;       // game state facing the next player
+    bool count_turn : 1;            // true (ie. 1) if turn count should be incremented
+    bool count_trick : 1;           // same for trick count
 };
 
 // Action lookup table to encode all of game state transitions so that the main game loop has as
