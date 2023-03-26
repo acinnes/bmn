@@ -630,8 +630,8 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
 
 #define USE_SHARED_MEM_FOR_DEALS 1
 
-#define BLOCKS 32
-#define THREADS_PER_BLOCK 32
+#define BLOCKS 16
+#define THREADS_PER_BLOCK 128
 #define NUM_THREADS (BLOCKS * THREADS_PER_BLOCK)
 
 #ifdef USE_SHARED_MEM_FOR_DEALS
