@@ -715,7 +715,8 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
 // capacity (which is typically 2 warps of 32 threads each on eg. Turing architecture GPUs.)
 
 #define USE_SHARED_MEM_FOR_DEALS 1
-#define DEAL_CLASS StackOfCards // or StandardDeck
+#define DEAL_CLASS StandardDeck
+//#define DEAL_CLASS StackOfCards
 
 #define BLOCKS 16
 #define THREADS_PER_BLOCK 128
@@ -724,7 +725,7 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
 #ifdef USE_SHARED_MEM_FOR_DEALS
 // Assume 48KB of each SM's shared mem can be used
 #define NUM_DEALS ((48*1024)/sizeof(DEAL_CLASS))
-#define NUM_BATCHES (1024*1024/BLOCKS/NUM_DEALS)
+#define NUM_BATCHES 128
 #else
 #define NUM_DEALS (1024*1024/BLOCKS)
 #define NUM_BATCHES 1
@@ -993,6 +994,9 @@ void run_search(unsigned long long seed) {}
 int main(int argc, char **argv) {
 #ifdef USE_CUDA
     printf("%d/%d blocks/threads == %d searchers\n", BLOCKS, THREADS_PER_BLOCK, BLOCKS * THREADS_PER_BLOCK);
+    printf("%u deals * %u batches * %u blocks == %u deals per search\n",
+           (unsigned)NUM_DEALS, (unsigned)NUM_BATCHES, (unsigned)BLOCKS,
+           (unsigned)(NUM_DEALS * NUM_BATCHES * BLOCKS));
     printf("sizeof(BestDealSearcher) is %zd bytes\n", sizeof(BestDealSearcher));
     printf("sizeof(StackOfCards) is %zd bytes\n", sizeof(StackOfCards));
     printf("sizeof(StandardDeck) is %zd bytes\n", sizeof(StandardDeck));
