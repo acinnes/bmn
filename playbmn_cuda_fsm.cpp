@@ -682,10 +682,11 @@ public:
         unsigned int tid = threadIdx.x;
         // Work on a local copy of the rng state for speed
         curandState my_rng = rng[tid];
-        // Start with a fixed per-suit descending order, for reproducibilty, then generate a fresh
-        // batch of fully random shuffles ready to be played.
-        StackOfCards deck;
-        deck.set_full_deck();
+        // Start with a fixed per-suit descending order the very first time, for reproducibilty, but
+        // then continue shuffling each deck to allow as much meandering as possible.
+        StackOfCards deck = deals[tid];
+        if (deck.empty())
+            deck.set_full_deck();
         auto num_cards = deck.num_cards();
         for (unsigned deal = tid; deal < NUM_DEALS; deal += THREADS_PER_BLOCK) {
             for (unsigned i = 0; i < num_cards-1; i++) {
