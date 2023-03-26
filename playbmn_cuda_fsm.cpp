@@ -329,12 +329,6 @@ NextAction action_table[NUM_PLAYERS][NUM_STATES][NUM_CARDS] =
     }
 };
 
-// Copmact representation of a shuffled deck.
-class StandardDeck {
-    Card cards[52];
-};
-
-
 // Representation of a stack of cards optimized for BMN, specifically designed for efficiently popping
 // from the beginning of the stack and appending to the end.
 // Takes advantage of the fact that a stack can contain at most all 52 cards in a standard deck.
@@ -344,14 +338,17 @@ class StandardDeck {
 
 class StackOfCards : public Managed
 {
-  private:
+private:
     unsigned first = 0;
     unsigned insert = 0;
     Card cards[64];
     static const unsigned stack_mask = sizeof(cards)/sizeof(Card) - 1;
 
 public:
+    friend class StandardDeck;
+
     StackOfCards() = default;
+    StackOfCards(StandardDeck& d);
 
     DEVICE_CALLABLE
     bool operator==(const StackOfCards& other) {
@@ -486,6 +483,95 @@ public:
         b.insert = 26;
     }
 };
+
+
+// Minimal representation of a shuffled deck.
+class StandardDeck {
+private:
+    Card cards[52];
+
+public:
+    friend class StackOfCards;
+
+    StandardDeck() = default;
+
+    DEVICE_CALLABLE
+    unsigned num_cards() const {
+        return 52;
+    }
+
+    DEVICE_CALLABLE
+    bool operator==(const StandardDeck& other) {
+        if (num_cards() != other.num_cards())
+            return false;
+        for (unsigned i = 0; i < num_cards(); i++)
+            if (cards[i] != other.cards[i])
+                return false;
+        return true;
+    }
+
+    DEVICE_CALLABLE
+    bool operator!=(const StandardDeck& other) { return !(this->operator==(other)); }
+
+    // Initialize with the full standard 52-card deck, in a canonical sort order.
+    DEVICE_CALLABLE
+    void set_full_deck() {
+        unsigned index = 0;
+        for (int i = 0; i < 4; i++) {
+            cards[index++] = ace;
+            cards[index++] = king;
+            cards[index++] = queen;
+            cards[index++] = jack;
+            for (int j = 0; j < 9; j++) {
+                cards[index++] = numeral;
+            }
+        }
+    }
+
+    std::string to_string() const {
+        const char syms[] = {'-', 'J', 'Q', 'K', 'A'};
+        char tmp[53];
+        char *t = tmp;
+        for (unsigned i = 0; i < sizeof(cards); i++) {
+            auto card = cards[i];
+            assert(card <= ace);
+            *t++ = syms[card];
+        }
+        *t = 0;
+        return std::string(tmp);
+    }
+
+    DEVICE_CALLABLE
+    void swap(unsigned i, unsigned j) {
+        auto ival = cards[i];
+        auto jval = cards[j];
+        cards[i] = jval;
+        cards[j] = ival;
+    }
+
+    // Initialize the two hands from a starting deck
+    DEVICE_CALLABLE
+    void set_hands(StackOfCards& a, StackOfCards& b) {
+        // put first half of full deck in a, second half in b
+        for (int i=0; i<26; i++) {
+            a.cards[i] = cards[i];
+        }
+        a.first = 0;
+        a.insert = 26;
+        for (int i=0; i<26; i++) {
+            b.cards[i] = cards[i+26];
+        }
+        b.first = 0;
+        b.insert = 26;
+    }
+};
+
+StackOfCards::StackOfCards(StandardDeck& d) {
+    first = 0;
+    insert = 52;
+    std::memcpy(cards, d.cards, sizeof(cards));
+}
+
 
 // Play out a deal using finite state machine approach, to provide better concurrency in CUDA warps.
 DEVICE_CALLABLE
@@ -636,7 +722,7 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
 
 #ifdef USE_SHARED_MEM_FOR_DEALS
 // Assume 48KB of each SM's shared mem can be used
-#define NUM_DEALS ((48*1024)/sizeof(StackOfCards))
+#define NUM_DEALS ((48*1024)/sizeof(StandardDeck))
 #define NUM_BATCHES (1024*1024/BLOCKS/NUM_DEALS)
 #else
 #define NUM_DEALS (1024*1024/BLOCKS)
@@ -650,8 +736,8 @@ public:
     // Best deals seen by this searcher (across all batches so far)
     unsigned best_turns = 0;
     unsigned best_tricks = 0;
-    StackOfCards best_turns_deal;
-    StackOfCards best_tricks_deal;
+    StandardDeck best_turns_deal;
+    StandardDeck best_tricks_deal;
     // Track best deals seen so far by each thread (to avoid synchronization while playing).
     struct {
         unsigned best_turns;
@@ -663,30 +749,29 @@ public:
     curandState rng[THREADS_PER_BLOCK];
 #ifndef USE_SHARED_MEM_FOR_DEALS
     // Batch of deals to play; this is not mutated, so we can read back the best deal(s) at the end.
-    StackOfCards deals[NUM_DEALS];
+    StandardDeck deals[NUM_DEALS];
 #endif
 
     BestDealSearcher() = default;
 
     DEVICE_ONLY
-    void init(unsigned long long seed) {
+    void init(unsigned long long seed, StandardDeck deals[]) {
         unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
         // Use multiple CUDA threads as recommended to parallelize the shuffling. We need to make
         // RNGs independent for every thread across the whole grid, but note we are only working
         // with this block's threads here.
         curand_init(seed, tid, 0, &rng[threadIdx.x]);
+        // Start with a fixed per-suit descending order the very first time, for reproducibilty.
+        deals[threadIdx.x].set_full_deck();
     }
 
     DEVICE_ONLY
-    void generate_batch(StackOfCards deals[]) {
+    void generate_batch(StandardDeck deals[]) {
         unsigned int tid = threadIdx.x;
         // Work on a local copy of the rng state for speed
         curandState my_rng = rng[tid];
-        // Start with a fixed per-suit descending order the very first time, for reproducibilty, but
-        // then continue shuffling each deck to allow as much meandering as possible.
-        StackOfCards deck = deals[tid];
-        if (deck.empty())
-            deck.set_full_deck();
+        auto deck = deals[tid];
+        // Continue shuffling from state in last batch to allow as much meandering as possible.
         auto num_cards = deck.num_cards();
         for (unsigned deal = tid; deal < NUM_DEALS; deal += THREADS_PER_BLOCK) {
             for (unsigned i = 0; i < num_cards-1; i++) {
@@ -706,7 +791,7 @@ public:
     // It isn't clear whether it would be better to minimise the overhead of switching to a new
     // game, by moving game state into each deal so we can switch game by just changing `this_deal`.
     DEVICE_ONLY
-    void play_batch(StackOfCards deals[]) {
+    void play_batch(StandardDeck deals[]) {
 #ifdef USE_SHARED_TABLE
         // Keep action table in fast shared memory, rather than relying on caching.
         __shared__ NextAction shared_action_table[NUM_PLAYERS][NUM_STATES][NUM_CARDS];
@@ -774,7 +859,7 @@ public:
     }
 
     DEVICE_ONLY
-    void update_best_deals(StackOfCards deals[]) {
+    void update_best_deals(StandardDeck deals[]) {
         if (threadIdx.x != 0)
             return;
         for (unsigned tid = 0; tid < THREADS_PER_BLOCK; tid++) {
@@ -800,13 +885,19 @@ public:
 
 __global__
 void cuda_init_searchers(BestDealSearcher *searchers, unsigned long long seed) {
-    searchers[blockIdx.x].init(seed);
+#ifdef USE_SHARED_MEM_FOR_DEALS
+    __shared__ StandardDeck deals[NUM_DEALS];
+#define DEALS deals
+#else
+#define DEALS (searchers[blockIdx.x].deals)
+#endif
+    searchers[blockIdx.x].init(seed, DEALS);
 }
 
 __global__
 void cuda_run_searchers(BestDealSearcher *searchers) {
 #ifdef USE_SHARED_MEM_FOR_DEALS
-    __shared__ StackOfCards deals[NUM_DEALS];
+    __shared__ StandardDeck deals[NUM_DEALS];
 #define DEALS deals
 #else
 #define DEALS (searchers[blockIdx.x].deals)
@@ -864,7 +955,7 @@ void run_search(unsigned long long seed) {
                     }
                     if (searcher->best_turns > global_best_turns) {
                         global_best_turns = searcher->best_turns;
-                        auto deck = searcher->best_turns_deal;
+                        StackOfCards deck = searcher->best_turns_deal;
                         unsigned turns, tricks;
                         play(deck, turns, tricks);
                         printf("%s: %d turns, %d tricks\n", deck.to_string().data(), turns, tricks);
@@ -877,7 +968,7 @@ void run_search(unsigned long long seed) {
                     if (searcher->best_tricks > global_best_tricks) {
                         global_best_tricks = searcher->best_tricks;
                         if (searcher->best_tricks_deal != searcher->best_turns_deal) {
-                            auto deck = searcher->best_tricks_deal;
+                            StackOfCards deck = searcher->best_tricks_deal;
                             unsigned turns, tricks;
                             play(deck, turns, tricks);
                             printf("%s: %d turns, %d tricks\n", deck.to_string().data(), turns, tricks);
