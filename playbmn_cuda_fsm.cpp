@@ -715,6 +715,7 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
 // capacity (which is typically 2 warps of 32 threads each on eg. Turing architecture GPUs.)
 
 #define USE_SHARED_MEM_FOR_DEALS 1
+#define DEAL_CLASS StackOfCards // or StandardDeck
 
 #define BLOCKS 16
 #define THREADS_PER_BLOCK 128
@@ -722,7 +723,7 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
 
 #ifdef USE_SHARED_MEM_FOR_DEALS
 // Assume 48KB of each SM's shared mem can be used
-#define NUM_DEALS ((48*1024)/sizeof(StandardDeck))
+#define NUM_DEALS ((48*1024)/sizeof(DEAL_CLASS))
 #define NUM_BATCHES (1024*1024/BLOCKS/NUM_DEALS)
 #else
 #define NUM_DEALS (1024*1024/BLOCKS)
@@ -736,8 +737,8 @@ public:
     // Best deals seen by this searcher (across all batches so far)
     unsigned best_turns = 0;
     unsigned best_tricks = 0;
-    StandardDeck best_turns_deal;
-    StandardDeck best_tricks_deal;
+    DEAL_CLASS best_turns_deal;
+    DEAL_CLASS best_tricks_deal;
     // Track best deals seen so far by each thread (to avoid synchronization while playing).
     struct {
         unsigned best_turns;
@@ -747,31 +748,33 @@ public:
     } by_thread[THREADS_PER_BLOCK];
     // Use kernel version of curand in multi-threaded way
     curandState rng[THREADS_PER_BLOCK];
+    // Keep the last deal from the previous search run to use as the starting point for the next run
+    DEAL_CLASS starting_deck[THREADS_PER_BLOCK];
 #ifndef USE_SHARED_MEM_FOR_DEALS
     // Batch of deals to play; this is not mutated, so we can read back the best deal(s) at the end.
-    StandardDeck deals[NUM_DEALS];
+    DEAL_CLASS deals[NUM_DEALS];
 #endif
 
     BestDealSearcher() = default;
 
     DEVICE_ONLY
-    void init(unsigned long long seed, StandardDeck deals[]) {
+    void init(unsigned long long seed) {
         unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
         // Use multiple CUDA threads as recommended to parallelize the shuffling. We need to make
         // RNGs independent for every thread across the whole grid, but note we are only working
         // with this block's threads here.
         curand_init(seed, tid, 0, &rng[threadIdx.x]);
         // Start with a fixed per-suit descending order the very first time, for reproducibilty.
-        deals[threadIdx.x].set_full_deck();
+        starting_deck[threadIdx.x].set_full_deck();
     }
 
     DEVICE_ONLY
-    void generate_batch(StandardDeck deals[]) {
+    void generate_batch(DEAL_CLASS deals[]) {
         unsigned int tid = threadIdx.x;
         // Work on a local copy of the rng state for speed
         curandState my_rng = rng[tid];
+        // Continue shuffling from deals in the previous batch
         auto deck = deals[tid];
-        // Continue shuffling from state in last batch to allow as much meandering as possible.
         auto num_cards = deck.num_cards();
         for (unsigned deal = tid; deal < NUM_DEALS; deal += THREADS_PER_BLOCK) {
             for (unsigned i = 0; i < num_cards-1; i++) {
@@ -791,7 +794,7 @@ public:
     // It isn't clear whether it would be better to minimise the overhead of switching to a new
     // game, by moving game state into each deal so we can switch game by just changing `this_deal`.
     DEVICE_ONLY
-    void play_batch(StandardDeck deals[]) {
+    void play_batch(DEAL_CLASS deals[]) {
 #ifdef USE_SHARED_TABLE
         // Keep action table in fast shared memory, rather than relying on caching.
         __shared__ NextAction shared_action_table[NUM_PLAYERS][NUM_STATES][NUM_CARDS];
@@ -859,7 +862,7 @@ public:
     }
 
     DEVICE_ONLY
-    void update_best_deals(StandardDeck deals[]) {
+    void update_best_deals(DEAL_CLASS deals[]) {
         if (threadIdx.x != 0)
             return;
         for (unsigned tid = 0; tid < THREADS_PER_BLOCK; tid++) {
@@ -885,23 +888,19 @@ public:
 
 __global__
 void cuda_init_searchers(BestDealSearcher *searchers, unsigned long long seed) {
-#ifdef USE_SHARED_MEM_FOR_DEALS
-    __shared__ StandardDeck deals[NUM_DEALS];
-#define DEALS deals
-#else
-#define DEALS (searchers[blockIdx.x].deals)
-#endif
-    searchers[blockIdx.x].init(seed, DEALS);
+    searchers[blockIdx.x].init(seed);
 }
 
 __global__
 void cuda_run_searchers(BestDealSearcher *searchers) {
 #ifdef USE_SHARED_MEM_FOR_DEALS
-    __shared__ StandardDeck deals[NUM_DEALS];
+    __shared__ DEAL_CLASS deals[NUM_DEALS];
 #define DEALS deals
 #else
 #define DEALS (searchers[blockIdx.x].deals)
 #endif
+    // Continue from where the previous search run ended
+    DEALS[threadIdx.x] = searchers[blockIdx.x].starting_deck[threadIdx.x];
     for (unsigned batch = 0; batch < NUM_BATCHES; batch++) {
         searchers[blockIdx.x].generate_batch(DEALS);
         __syncthreads();
@@ -910,6 +909,9 @@ void cuda_run_searchers(BestDealSearcher *searchers) {
         searchers[blockIdx.x].update_best_deals(DEALS);
         __syncthreads();
     }
+    // Update starting point for the next search run
+    searchers[blockIdx.x].starting_deck[threadIdx.x] = DEALS[threadIdx.x];
+#undef DEALS
 }
 
 bool progress_printed = false;
@@ -930,9 +932,6 @@ void run_search(unsigned long long seed) {
             searchers[b].next_deal_to_play = 0;
         cuda_run_searchers<<<BLOCKS, THREADS_PER_BLOCK>>>(searchers);
         cudaDeviceSynchronize();
-        // To avoid unnecessary thread synchronization we track the best deals per thread while
-        // playing, so we now need to update the best ones seen across all of the threads and
-        // batches so far.
         for (unsigned b = 0; b < BLOCKS; b++) {
             global_deals_tested += NUM_DEALS * NUM_BATCHES;
         }
@@ -955,7 +954,7 @@ void run_search(unsigned long long seed) {
                     }
                     if (searcher->best_turns > global_best_turns) {
                         global_best_turns = searcher->best_turns;
-                        StackOfCards deck = searcher->best_turns_deal;
+                        StackOfCards deck(searcher->best_turns_deal);
                         unsigned turns, tricks;
                         play(deck, turns, tricks);
                         printf("%s: %d turns, %d tricks\n", deck.to_string().data(), turns, tricks);
@@ -968,7 +967,7 @@ void run_search(unsigned long long seed) {
                     if (searcher->best_tricks > global_best_tricks) {
                         global_best_tricks = searcher->best_tricks;
                         if (searcher->best_tricks_deal != searcher->best_turns_deal) {
-                            StackOfCards deck = searcher->best_tricks_deal;
+                            StackOfCards deck(searcher->best_tricks_deal);
                             unsigned turns, tricks;
                             play(deck, turns, tricks);
                             printf("%s: %d turns, %d tricks\n", deck.to_string().data(), turns, tricks);
@@ -996,6 +995,7 @@ int main(int argc, char **argv) {
     printf("%d/%d blocks/threads == %d searchers\n", BLOCKS, THREADS_PER_BLOCK, BLOCKS * THREADS_PER_BLOCK);
     printf("sizeof(BestDealSearcher) is %zd bytes\n", sizeof(BestDealSearcher));
     printf("sizeof(StackOfCards) is %zd bytes\n", sizeof(StackOfCards));
+    printf("sizeof(StandardDeck) is %zd bytes\n", sizeof(StandardDeck));
     printf("sizeof(curandState) is %zd bytes\n", sizeof(curandState));
     printf("sizeof(action_table) is %zd bytes\n", sizeof(action_table));
 #endif
