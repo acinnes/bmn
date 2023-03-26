@@ -1,3 +1,66 @@
+_Summary_
+
+Rough history of improvements, from initial trivial port to CUDA, to latest refinement.
+
+All speeds are in millions of deals played per second, on laptop with i7-9750H and GeForce GTX 1650.
+For fair comparisons, compile with NDEBUG defined in order to compile out asserts.
+
+CPU baseline (playbmn.cpp):
+- 1 thread:    0.56   (CPU running at 4.0GHz)
+- 2 threads:   1.1   (4.0GHz)
+- 4 threads:   1.7    (3.3GHz)
+- 8 threads:   2.5    (2.9GHz)
+- 12 threads:  3.0    (2.8GHz)
+- 16 threads:  3.0    (2.8GHz)
+
+GPU baseline (playbmn.cpp):
+- 32 blocks of 32 threads:    2.3
+
+CPU lookup table (playbmn_fsm.cpp):
+- 1 thread:    0.27   (CPU running at 4.0GHz)
+- 2 threads:   0.52   (4.0GHz)
+- 4 threads:   1.0    (3.7GHz)
+- 8 threads:   1.4    (2.7GHz)
+- 12 threads:  1.9    (2.7GHz)
+- 16 threads:  1.9    (2.7GHz)
+
+GPU lookup table (playbmn_fsm.cpp):
+- 128 blocks of 32 threads
+
+--> 1.4
+
+GPU lookup table with continual play from "global" backlog (playbmn_cuda_fsm.cpp):
+- without USE_SHARED_TABLE
+- without USE_SHARED_MEM_FOR_DEALS
+- default enum and action_table size
+- DEAL_CLASS is StackOfCards
+- 32 blocks of 32 threads
+
+--> 2.5   (P0, 75C, 98% sm util)
+--> 2.3   (P3, 74C, 97% sm util)
+
+GPU "shared" lookup table with continual play from "global" backlog (playbmn_cuda_fsm.cpp):
+- with USE_SHARED_TABLE
+- minimum enum and action_table size
+- without USE_SHARED_MEM_FOR_DEALS
+- DEAL_CLASS is StackOfCards
+- 32 blocks of 32 threads
+
+--> 3.5 ??
+
+....
+
+GPU "shared" lookup table with continual play from "global" backlog (playbmn_cuda_fsm.cpp):
+- without USE_SHARED_TABLE
+- minimum enum and action_table size
+- with USE_SHARED_MEM_FOR_DEALS
+- DEAL_CLASS is StandardDeck
+- 16 blocks of 128 threads
+
+--> ~100
+
+_Old Runs (To be replaced with more precise info)_
+
 Best run so far, making Card uint8_t, and packing the action_table entries into fewer bits.
 
 ```
@@ -14,9 +77,13 @@ Q-----KQ---QA--J--J-A-A-J---QK-----K----JA------K---: 3316 turns, 457 tricks
 -Q--K----Q-JAK-------J----AK--A---JA---KQ----Q-----J: 3737 turns, 516 tricks
 4 seconds, 25165824 deals tested (6.29146e+06 per second)
 -----A----K--A----KQ------K--JQJQA------A-Q------KJJ: 3741 turns, 513 tricks
-10 seconds, 56623104 deals tested (5.66231e+06 per second)
+9 seconds, 56623104 deals tested (6.29146e+06 per second)
 --J----J------KQ--K---A--A--AQ-Q--------J-KA---J--KQ: 4901 turns, 696 tricks
-270 seconds, 1264582656 deals tested (4.68364e+06 per second)
+3341 seconds, 15514730496 deals tested (4.64374e+06 per second)
+Q-K-----JJQ------K----A-K-JA------------KJ-A-Q--Q-A-: 4983 turns, 698 tricks
+5851 seconds, 27269267456 deals tested (4.66062e+06 per second)
+--------KQ---A---QJKJ---Q---K-----JJ--AQ-AK---A-----: 5603 turns, 765 tricks
+22124 seconds, 103898152960 deals tested (4.69617e+06 per second)
 ```
 
 
