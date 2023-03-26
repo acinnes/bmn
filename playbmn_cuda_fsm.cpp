@@ -1,3 +1,11 @@
+#ifndef OVERRIDES
+#define USE_SHARED_MEM_FOR_DEALS
+#define COMPACT_DECK
+#define PACKED_CARDS
+#define PACKED_ACTIONS
+#endif
+
+
 #include <iostream>
 #include <random>
 #include <utility>
@@ -65,7 +73,11 @@ bool verbose = false;
 // to find the longest possible games of BMN.
 
 // Use a simplified representation of cards that is optimized for BMN.
+#ifdef PACKED_CARDS
 enum Card : uint8_t
+#else
+enum Card
+#endif
 {
     numeral = 0,
     jack = 1,
@@ -103,6 +115,7 @@ enum GameState
 // current player, game_state, and next_card. The action information for that combination takes care
 // of encoded whether we need to switch player, whether a "battle" is in progress and for how many
 // moves, whether a turn should be counted and whether a trick should be counted.
+#ifdef PACKED_ACTIONS
 struct NextAction
 {
     Player destination : 4;         // index to the right stack of cards to receive next_card
@@ -111,6 +124,16 @@ struct NextAction
     bool count_turn : 1;            // true (ie. 1) if turn count should be incremented
     bool count_trick : 1;           // same for trick count
 };
+#else
+struct NextAction
+{
+    Player destination;         // index to the right stack of cards to receive next_card
+    Player next_player;         // player (or pile as a psuedo-player) who takes the next turn
+    GameState next_state;       // game state facing the next player
+    bool count_turn;            // true (ie. 1) if turn count should be incremented
+    bool count_trick;           // same for trick count
+};
+#endif
 
 // Action lookup table to encode all of game state transitions so that the main game loop has as
 // little branching as possible, to minimise divergence across CUDA threads playing independent
@@ -714,12 +737,16 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
 // blocks to fill all of the SMs, and enough threads per block to fully use each SM's warp dispatch
 // capacity (which is typically 2 warps of 32 threads each on eg. Turing architecture GPUs.)
 
-#define USE_SHARED_MEM_FOR_DEALS 1
+#ifdef COMPACT_DECK
 #define DEAL_CLASS StandardDeck
-//#define DEAL_CLASS StackOfCards
+#else
+#define DEAL_CLASS StackOfCards
+#endif
 
+#ifndef BLOCKS
 #define BLOCKS 16
 #define THREADS_PER_BLOCK 128
+#endif
 #define NUM_THREADS (BLOCKS * THREADS_PER_BLOCK)
 
 #ifdef USE_SHARED_MEM_FOR_DEALS
@@ -729,7 +756,7 @@ void play(StackOfCards& deal, unsigned& turns, unsigned& tricks) {
 #else
 #define NUM_DEALS (1024*1024/BLOCKS)
 #define NUM_BATCHES 1
-#define USE_SHARED_TABLE 1
+//#define USE_SHARED_TABLE 1
 #endif
 
 class BestDealSearcher : public Managed {
