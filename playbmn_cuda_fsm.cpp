@@ -954,6 +954,7 @@ void run_search(unsigned long long seed) {
     cudaDeviceSynchronize();
     clock_t start_time = clock();
     clock_t last_update_time = start_time;
+    unsigned long long last_deals_tested = 0;
 
     while (true) {
         for (unsigned b = 0; b < BLOCKS; b++)
@@ -966,12 +967,15 @@ void run_search(unsigned long long seed) {
 
         // Report progress and best deals so far, but at most once a second
         auto now = clock();
-        if ((now - last_update_time) / CLOCKS_PER_SEC >= 1) {
+        double secs_since_last_report = (double)(now - last_update_time) / CLOCKS_PER_SEC;
+        if (secs_since_last_report >= 1) {
             last_update_time = now;
 
-            double secs_since_start = (now - start_time) / CLOCKS_PER_SEC;
-            printf("\r%g seconds, %llu deals tested (%g per second)",
-                   secs_since_start, global_deals_tested, global_deals_tested / secs_since_start);
+            double secs_since_start = (double)(now - start_time) / CLOCKS_PER_SEC;
+            printf("\r%g seconds, %llu deals tested (%g per second since start) (%g in last second)    ",
+                   secs_since_start, global_deals_tested, global_deals_tested / secs_since_start,
+                   (global_deals_tested - last_deals_tested) / secs_since_last_report);
+            last_deals_tested = global_deals_tested;
             progress_printed = true;
             for (unsigned b = 0; b < BLOCKS; b++) {
                 auto searcher = &searchers[b];
