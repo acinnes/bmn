@@ -61,6 +61,33 @@ GPU "shared" lookup table with continual play from "global" backlog (playbmn_cud
 
 _Old Runs (To be replaced with more precise info)_
 
+2023-03-29: My best run by far (ie. longest game). This is also the fastest version of the program
+so far, last config as described above, averaging 98m deals per second on a GeForce GTX 1650:
+
+```
+playbmn_cuda_fsm --seed 987654321
+16/128 blocks/threads == 2048 searchers
+945 deals * 128 batches * 16 blocks == 1935360 deals per search
+sizeof(BestDealSearcher) is 14968 bytes
+sizeof(StackOfCards) is 72 bytes
+sizeof(StandardDeck) is 52 bytes
+sizeof(curandState) is 48 bytes
+sizeof(action_table) is 1008 bytes
+1.013 seconds, 116121600 deals tested (1.14631e+08 per second since start) (1.14631e+08 in last second)
+Q---J--J--J----A-------K-Q-----A-Q----KKA-A-KJ-Q----: 2508 turns, 340 tricks
+-----A--Q------AA-K---Q-QA-QJK-K-J-JJ----------K----: 2498 turns, 344 tricks
+J------J----J-QQ--K---A----JKQ----------KQ--A-K--A-A: 2641 turns, 365 tricks
+3.024 seconds, 356106240 deals tested (1.1776e+08 per second since start) (1.18687e+08 in last second)
+-KAJ---K--K-Q-K--------Q--QA--Q--------A--JJA------J: 2879 turns, 404 tricks
+6.066 seconds, 704471040 deals tested (1.16134e+08 per second since start) (1.14518e+08 in last second)
+-JK---A---A-J-A------A-K-----QQ---K-Q--Q-J-J--K-----: 3997 turns, 552 tricks
+439.123 seconds, 43222394880 deals tested (9.84289e+07 per second since start) (9.87034e+07 in last second)
+--Q--------J--A-------J----QKQK--A----K-JA-K-Q--JA--: 4005 turns, 566 tricks
+488.624 seconds, 48107243520 deals tested (9.84545e+07 per second since start) (9.88593e+07 in last second)
+K-----A-----QA---QQAK---J------QKJ-------K-J--A----J: 6005 turns, 839 tricks
+```
+
+
 Best run so far, making Card uint8_t, and packing the action_table entries into fewer bits.
 
 ```
