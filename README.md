@@ -3,8 +3,9 @@
 A learning exercise in speeding up a computationally intensive parallelizable C++ program, by
 leveraging CUDA GPUs.
 
-In this case, the computationally intensive algorithm is to continuously play games of Beggar My
-Neighbour, looking for the longest game (as measured either in player turns, or tricks played). It
+In this case, the computationally intensive algorithm is to continuously play games of [Beggar My
+Neighbour](https://en.wikipedia.org/wiki/Beggar-my-neighbour),
+looking for the longest game (as measured either in player turns, or tricks played). It
 is not known whether there is a game that will never end, though empirically it seems unlikely, and
 the programs here all assume every game will finish in a finite number of moves.
 
