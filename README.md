@@ -1,4 +1,206 @@
-_Summary_
+#  Introduction
+
+A learning exercise in speeding up a computationally intensive parallelizable C++ program, by
+leveraging CUDA GPUs.
+
+In this case, the computationally intensive algorithm is to continuously play games of Beggar My
+Neighbour, looking for the longest game (as measured either in player turns, or tricks played). It
+is not known whether there is a game that will never end, though empirically it seems unlikely, and
+the programs here all assume every game will finish in a finite number of moves.
+
+This is essentially a toy algorithm, but it has some notable features which are relevant to the
+challenge of effectively leveraging a GPU.
+
+1. Game play is completely deterministic, so the outcome is defined only by the initial sorting of
+   the deck. The problem is therefore embarrassingly parallel, since the large dimension is the
+   number of distinct deals, which can in principle all be explored in parallel.   
+2. The algorithm to play one game tracks game state by using a combination of a few simple state
+   variables and branching logic. This is easy to write and verify, and also reasonably efficient to
+   run on a single CPU core.
+3. The core algorithm (to play one game) is very compact in terms of code size and data size. The
+   surrounding algorithm to play many games while tracking the best ones so far is also naturally
+   compact.
+
+#  Steps In Improving Speed
+
+## Starting Point
+
+The original C++ program is `playbmn_cpu.cpp`. Using the Visual Studio C++ command line build tools
+for Windows x64, it can be compiled and run like so:
+
+```
+C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat
+cl /Zi /EHsc /DNDEBUG /O2 playbmn_cpu.cpp
+playbmn_cpu [-t N]
+```
+
+On my laptop with a Core i7-9750H, using a single thread, I get a sustained deal rate of about
+614,000 deals per second. Using 6 threads (to match the physical core count) I get about 2.3M deals
+per second. At 12 threads (to match the logical core count) I get close to 2.9M, which as expected
+is as fast as it will go.
+
+
+## GPU Baseline
+
+The latest CPU version so far is `playbmn.cpp`. It performs slightly better than the original
+version when using all logical cores, due to a tiny data structure tweak. It can also be compiled
+with `nvcc` to run as a straight port to CUDA, basically just substituting CUDA threads for CPU
+threads. I've chosen a CUDA blocksize and thread count that seems to be optimal for my laptop (32
+for each).
+
+```
+copy playbmn.cpp playbmn_gpu.cu
+nvcc -DUSE_CUDA -DNDEBUG -lcurand -o playbmn_gpu.exe playbmn_gpu.cu
+playbmn_gpu
+```
+
+On my laptop the GPU baseline manages about **2.3M deals per second**, using a GeForce GTX 1650 which
+has 896 CUDA cores. The interesting comparison is with the CPU version using all logical cores (12
+in my case), processing about **3M deals per second**.
+
+For reference, compute utilization on the GPU is 95%, while mem utilization is 0% (reflecting
+the unusual fact that we barely use any GPU memory, since we are iteratively shuffling and playing
+one deck per thread, and game play state is all in registers).
+
+
+## State Machine with Incremental Shuffling
+
+In an effort to minimise CUDA thread divergence within each warp of threads, I replaced the core
+game play algorithm (which relies on nested branching logic) with a state machine structure. That
+uses a central lookup table to map current state and latest input to the next state values. The idea
+is that all the CUDA threads will normally execute the lookup steps in unison, since the game state
+is now tracked purely in data and not also using the code position within the nested branching
+logic. The net effect should be more thread concurrency (since when divergence happens, threads
+execute potentially one at a time until they reach the same point in the code again).
+
+The search logic is unchanged; after each game finishes, the deck for that thread has a pair of
+cards swapped, to play the next game.
+
+The state machine version is found in `playbmn_fsm.cpp`, which can be compiled for CPU or GPU.
+
+```
+copy playbmn_fsm.cpp playbmn_fsm_gpu.cu
+nvcc -DUSE_CUDA -DNDEBUG -lcurand -o playbmn_fsm_gpu.exe playbmn_fsm_gpu.cu
+playbmn_fsm_gpu
+```
+
+Sadly, this results in a big step backwards in performance, from 2.3M to around 1.4 - 1.6M deals per
+second on GPU. (There is a similar drop in performance on CPU; branch prediction and speculative
+execution on CPU handles nested branching logic very well.)
+
+Compute utilization on the GPU is now around 80%, mem utilization is about 30%, since we are heavily
+accessing the lookup table in GPU memory but not able to use the system's full memory bandwidth.
+
+
+## State Machine with Large Backlog of Deals
+
+I realised thread divergence still happened because games are different lengths, and end of game was
+forcing an implicit thread synchronization (since the "play" function exits back to the search loop
+when each game finishes). To avoid this, I now precreate a large backlog of deals and have each CUDA
+thread pick the next game from the list whenever it finishes its current game. A single low-cost
+atomic operation is enough to do this without a full thread sync.
+
+At this point, the code is now quite CUDA specific, so I've forked it into `playbmn_cuda_fsm.cpp`
+which only compiles for GPU.
+
+```
+copy playbmn_cuda_fsm.cpp playbmn_cuda_fsm.cu
+nvcc -DOVERRIDES -DBLOCKS=32 -DTHREADS_PER_BLOCK=32 -DUSE_CUDA -DNDEBUG -lcurand -o playbmn_cuda_fsm.exe playbmn_cuda_fsm.cu
+playbmn_cuda_fsm
+```
+
+This improves speed compared to the initial State Machine version, but only to about 2.8M deals per
+second at best (degrading to 2.2M or so under thermal throttling), so roughly the same as the
+baseline version. Surely something is still not being done right? Time to look at what the Insight
+GPU runtime performance analysis tool can tell us!
+
+Compute utilization on the GPU is now around 98%, mem utilization is about 15% (also indicating
+memory use is not efficient yet). Changing blocks/threads to 16/128 has similar results, but
+improves mem utilization to 25%.
+
+
+## State Machine with Lookup Table in Shared Memory
+
+Based on information from the Insight GPU instruction runtime analysis tool, that memory access was
+a big bottleneck and compute resources are barely being used, I tried placing the state machine
+lookup table in SM Shared Memory, since it is accessed in the inner game loop. For reference, shared
+memory is a very small space (48KB) of very fast SRAM, where access speed is virtually the same as
+register access speed. The table has to be copied into SRAM for each block of threads though.
+
+```
+copy playbmn_cuda_fsm.cpp playbmn_cuda_fsm.cu
+nvcc -DOVERRIDES -DUSE_SHARED_TABLE -DUSE_CUDA -DNDEBUG -lcurand -o playbmn_cuda_fsm.exe playbmn_cuda_fsm.cu
+playbmn_cuda_fsm
+```
+
+Basically this results in no change. I believe it is because in the previous version the lookup
+table fits in L1 cache, which is also in SRAM alongside shared memory. Actually this version is
+slightly slower, presumably from the small overhead of copying the lookup table into shared memory
+for each thread block.
+
+Compute utilization on the GPU is still around 98%, mem utilization about 25% (still indicating
+memory use is not that efficient yet).
+
+
+## State Machine with Small Backlogs in Shared Memory
+
+Since memory access speed is still the primary bottleneck, it must be related to reading from the
+large backlog in main GPU memory (on the order of 20x slower than SRAM), even though we aren't doing
+that in the innermost game play loop. So let's just use a small backlog in SRAM and not touch main
+GPU memory very much. (We leave the lookup table in main GPU memory, relying on L1 cache to handle
+it and leaving more shared memory for the backlogs.) This has a minor drawback that we don't have a
+single backlog shared perfectly across all threads, but instead a small backlog for each block of
+threads -- since game lengths can vary quite a lot, we will have individual threads run out of games
+to play more often.
+
+```
+copy playbmn_cuda_fsm.cpp playbmn_cuda_fsm.cu
+nvcc -DOVERRIDES -DUSE_SHARED_MEM_FOR_DEALS -DUSE_CUDA -DNDEBUG -lcurand -o playbmn_cuda_fsm.exe playbmn_cuda_fsm.cu
+playbmn_cuda_fsm
+```
+
+However, even with the minor drawback of losing a shared backlog, this finally gives us a big gain.
+Performance pulls ahead of CPU baseline by an order of magnitude, achieving roughly 40M deals per
+second (which drops off somewhat when thermal throttling kicks in, to about 36M on average). Can we
+do even better though? Insight tools are still saying compute resources aren't being used very
+effectively.
+
+Compute utilization on the GPU has dropped quite a lot to 70%, and mem utilization is down to about
+15%. On the face of it, this looks bad, yet the game playing speed is obviously the best so far. So
+it seems there could still be room for improvement, if we can make progress on the poor memory
+utilization.
+
+
+## State Machine with Small Backlogs in Shared Memory, uint8 enum type
+
+Since everything important is already in shared memory, the next step is to make those data
+structures more compact. The final optimization I made was to shrink them by changing the base type
+for C++ enums from `int` (32-bits) to `uint8` (8-bits), packing the lookup table cells into fewer
+bits, and storing deals in the backlogs in a smaller data structure (not the larger one that is
+optimized for game playing). The benefit is two-fold: more deals can be precreated in a batch
+operation when the backlog needs to be refilled, and less memory (SRAM) bandwidth is needed per
+cycle of game play.
+
+```
+copy playbmn_cuda_fsm.cpp playbmn_cuda_fsm.cu
+nvcc  -DUSE_CUDA -DNDEBUG -lcurand -o playbmn_cuda_fsm.exe playbmn_cuda_fsm.cu
+playbmn_cuda_fsm
+```
+
+The cumulative effect is finally what I was hoping for! Sustained speed is around 100M deals per
+second, which is 43x what the initial port to GPU achieved, and 33x the CPU baseline we started
+with.
+
+Compute utilization on the GPU is now back up, to 93%, mem utilization is actually at 1%. I think
+this means mem utilization reflects bandwidth to main GPU memory, which in our case (rather
+unusually) can be almost completely avoided. This would seem to be about as good as we can hope to
+get.
+
+
+---------------
+
+
+#  Log of Results
 
 Rough history of improvements, from initial trivial port to CUDA, to latest refinement.
 
