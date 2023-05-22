@@ -63,7 +63,7 @@ bool verbose = false;
 // to find the longest possible games of BMN.
 
 // Use a simplified representation of cards that is optimized for BMN.
-enum Card
+enum Card : uint8_t
 {
     numeral = 0,
     jack = 1,
@@ -278,6 +278,7 @@ public:
     curandState rng;
 #else
     std::mt19937_64 rng;
+#ifdef REPORT_STATS
     // Track stats on turns per game, to get a sense of what threshold would be useful for a
     // fixed-iteration filter approach (where we run all games on CUDA for a fixed number of turns,
     // and let the CPU threads look at any games that still aren't finished).
@@ -286,6 +287,7 @@ public:
     unsigned long long total_turns = 0;
     unsigned long game_counts[MAX_TURNS + 1] = {0};
     unsigned over_max = 0;
+#endif
 #endif
 
     BestDealSearcher() = default;
@@ -296,6 +298,7 @@ public:
         play(deal, turns, tricks);
         ++deals_tested;
 #ifndef USE_CUDA
+#ifdef REPORT_STATS
         num_games++;
         total_turns += turns;
         if (turns <= MAX_TURNS) {
@@ -303,6 +306,7 @@ public:
         } else {
             over_max++;
         }
+#endif
 #endif
         if (turns > best_turns) {
             best_turns = turns;
@@ -428,7 +432,7 @@ std::mutex global_mutex;
 bool progress_printed = false;
 unsigned global_best_turns = 0;
 unsigned global_best_tricks = 0;
-unsigned long global_deals_tested = 0;
+unsigned long long global_deals_tested = 0;
 
 void run_search(int worker_id) {
     // Generalize to allow a list of searchers to be run/managed by each worker (since in cuda mode
@@ -474,7 +478,7 @@ void run_search(int worker_id) {
                 searcher.deals_tested = 0;
                 if (worker_id <= 1) {
                     double secs_since_start = (now - start_time) / CLOCKS_PER_SEC;
-                    printf("\r%g seconds, %ld deals tested (%g per second)",
+                    printf("\r%g seconds, %llu deals tested (%g per second)",
                            secs_since_start, global_deals_tested, global_deals_tested / secs_since_start);
                     progress_printed = true;
                 }
@@ -506,6 +510,7 @@ void run_search(int worker_id) {
             }
         }
 #ifndef USE_CUDA
+#ifdef REPORT_STATS
         // Every minute report stats on number of turns per game
         if (worker_id <= 1 && (now - last_stats_time) / CLOCKS_PER_SEC >= 60) {
             last_stats_time = now;
@@ -542,6 +547,7 @@ void run_search(int worker_id) {
             printf("--> Turns per game: min=%u, avg=%g, p50=%u, p75=%u, p95=%u, p99=%u, p999=%u, p9999=%u, >%u=%u\n",
                    min_turns, average_turns, p50_turns, p75_turns, p95_turns, p99_turns, p999_turns, p9999_turns, MAX_TURNS, searchers[0].over_max);
         }
+#endif
 #endif
     }
 }
